@@ -47,6 +47,8 @@ pub mod poc;
 pub mod pps;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod reconstruct;
+// LGPL-2.1-or-later: FFmpeg's choice of the pictures to output.
+pub(crate) mod recovery;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ref_list;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
