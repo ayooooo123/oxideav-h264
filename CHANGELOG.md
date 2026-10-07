@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retain compatibility with the PearTube oxideav-core API rather than
   requiring upstream output-parameter events.
 ## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-25
+### Fixed (PearTube fork)
+
+- decoder: pictures FFmpeg 2da55bf does not output are withheld
+  (`src/recovery.rs`, LGPL port): a picture is recovered at an IDR, at
+  the frame a recovery point SEI names, or at an unmarked random access
+  point whose marking did not fail, and nothing is output before the
+  first recovered picture (h264_slice.c:1392-1402, 1677-1707;
+  h264_refs.c:815-826). The reorder depth that heuristic reads starts
+  from the `video_delay` codec option (FFmpeg's probed
+  `codecpar->video_delay`). `h264_intra_first-small.ts`: 17 frames,
+  equal to FFmpeg's, instead of 20.
+
+### Added (PearTube fork)
+
+- decoder: `Decoder::output_video_dimensions` and
+  `Decoder::output_pixel_format` describe the frame `receive_frame`
+  returned last (its SPS-cropped size; 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4 at
+  8, 10 or 12 bits, full-range `J` variants at 8 bits), across SPS
+  changes; before the first frame they report the SPS being decoded.
 
 ### Added
 

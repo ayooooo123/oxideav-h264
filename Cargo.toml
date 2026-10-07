@@ -3,7 +3,8 @@ name = "oxideav-h264"
 version = "0.1.10"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+# src/recovery.rs ports FFmpeg (see LICENSE-LGPL); the rest is MIT.
+license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-h264"
 homepage = "https://github.com/OxideAV/oxideav-h264"
 authors = ["Mark Karpeles"]
@@ -23,6 +24,12 @@ nightly = []
 [dependencies]
 oxideav-core = "0.1"
 thiserror = "2"
+
+# Decoder::output_video_dimensions comes from the PearTube fork of the core,
+# at the revision the player pins (a [patch] applies only to this crate's own
+# builds; the player's workspace patches the core itself).
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "9a314bf862480d019dc1133847ff6262d14ba628" }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

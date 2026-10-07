@@ -48,7 +48,8 @@ use std::sync::Arc;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    VideoPlane,
 };
 
 use crate::decoder::{Decoder as H264Driver, Event};
@@ -56,7 +57,8 @@ use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::frame_thread::{Deferred, FtProvider, FtRef, FtSliceWork, Pool, SharedPlanes};
 use crate::mb_grid::MbGrid;
 use crate::picture::Picture;
-use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
+use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
+use crate::recovery::{MarkedPicture, Recovery};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
 use crate::slice_header::{
@@ -70,6 +72,14 @@ use crate::{reconstruct, slice_data};
 enum OutFrame {
     Ready(VideoFrame),
     Pending(Arc<SharedPlanes>),
+}
+
+struct OutputPicture {
+    frame: OutFrame,
+    width: u32,
+    height: u32,
+    format: Option<PixelFormat>,
+    recovered: u8,
 }
 
 /// The inputs of one §7.3.4 slice-data parse.
@@ -198,6 +208,12 @@ struct PictureInProgress {
     /// Frame threading — `Some` when the picture's samples are
     /// reconstructed on the worker pool.
     ft: Option<FtPicture>,
+    /// `crate::recovery::RECOVERED_*` bits of the picture.
+    recovered: u8,
+    /// The first slice of the frame (for a second field, of its first
+    /// field) is an I slice / a B slice: FFmpeg's `pict_type`.
+    frame_intra: bool,
+    frame_b: bool,
 }
 
 /// §C.4.4 — a decoded PAFF field awaiting its complementary field so the
@@ -221,6 +237,14 @@ struct PendingField {
     /// §7.4.2.1.1 — the frame cropping margins of the field's SPS,
     /// applied when the pair (or the lone field) is output.
     crop: FrameCropMargins,
+    /// Pixel layout of the field's samples (see [`OutputPicture::format`]).
+    format: Option<PixelFormat>,
+    /// `crate::recovery::RECOVERED_*` bits of the field; a pair's frame
+    /// carries the union of its two fields'.
+    recovered: u8,
+    /// The field's first slice is an I slice / a B slice.
+    frame_intra: bool,
+    frame_b: bool,
 }
 
 /// §8.1 — separate-colour-plane decode state (round 448). When the
@@ -239,10 +263,10 @@ struct PendingField {
 struct ScpState {
     subs: [Box<H264CodecDecoder>; 3],
     /// Per-plane decoded (monochrome) frames awaiting their two
-    /// siblings. The three sub-decoders run identical §8.2.1 / §C.4
-    /// machinery on identical slice-header fields, so their output
-    /// streams pair 1:1 in emission order.
-    queues: [VecDeque<VideoFrame>; 3],
+    /// siblings, with each frame's visible size. The three sub-decoders
+    /// run identical §8.2.1 / §C.4 machinery on identical slice-header
+    /// fields, so their output streams pair 1:1 in emission order.
+    queues: [VecDeque<(VideoFrame, Option<(u32, u32)>, Option<PixelFormat>)>; 3],
 }
 
 impl ScpState {
@@ -261,8 +285,16 @@ impl ScpState {
 
 /// Registry factory — called by the codec registry when a container
 /// wants a decoder for H.264.
+///
+/// Codec option `video_delay`: the reorder depth the demuxer measured
+/// while probing (FFmpeg's `codecpar->video_delay`, which its decoder
+/// starts from as `has_b_frames`); it decides which pictures after an
+/// unmarked random access point count as recovered.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut dec = H264CodecDecoder::new(params.codec_id.clone());
+    if let Some(delay) = params.options.get("video_delay").and_then(|v| v.parse::<u32>().ok()) {
+        dec.recovery.set_container_reorder_depth(delay);
+    }
     if !params.extradata.is_empty() {
         dec.consume_extradata(&params.extradata)?;
     }
@@ -307,7 +339,7 @@ pub struct H264CodecDecoder {
     /// lazily (or recreated on SPS change) from the active SPS's VUI
     /// bitstream restriction (§E.2.1), with an Annex A Table A-1
     /// fallback when the VUI block is absent.
-    output_dpb: DpbOutput<OutFrame>,
+    output_dpb: DpbOutput<OutputPicture>,
     /// Pictures that have already been "bumped" from the DPB and are
     /// waiting for `receive_frame`. This covers both:
     /// 1. entries evicted by `DpbOutput::push` when the queue is full,
@@ -316,8 +348,19 @@ pub struct H264CodecDecoder {
     ///    previous sequence's pictures are delivered in POC order
     ///    *before* the new sequence's first frames (§C.4).
     ///
-    /// Also used to carry the `flush()` drain at EOF.
-    ready: VecDeque<OutFrame>,
+    /// Also used to carry the `flush()` drain at EOF. Only pictures the
+    /// recovery gate ([`Self::release`]) passes get here.
+    ready: VecDeque<OutputPicture>,
+    /// Visible size and pixel layout of the frame `receive_frame` last
+    /// returned, which `output_video_dimensions` / `output_pixel_format`
+    /// report until the next one.
+    returned: Option<(u32, u32, Option<PixelFormat>)>,
+    /// Which pictures FFmpeg's decoder outputs (IDR, recovery point,
+    /// unmarked random access point).
+    recovery: Recovery,
+    /// The coded geometry of the last picture's SPS (see
+    /// [`SpsGeometry`]); a change reinitialises FFmpeg's decoder.
+    last_geometry: Option<SpsGeometry>,
     /// Packet-level pts passed on the most recent `send_packet`. We
     /// stamp the first frame produced from that packet with it.
     pending_pts: Option<i64>,
@@ -435,8 +478,11 @@ impl H264CodecDecoder {
             last_slice: None,
             decode_errors: 0,
             eof: false,
-            output_dpb: DpbOutput::<OutFrame>::new(16, 16),
+            output_dpb: DpbOutput::<OutputPicture>::new(16, 16),
             ready: VecDeque::new(),
+            returned: None,
+            recovery: Recovery::default(),
+            last_geometry: None,
             pending_pts: None,
             pending_dp: None,
             pending_time_base: TimeBase::new(1, 1),
@@ -729,6 +775,25 @@ impl H264CodecDecoder {
         self.ref_store.stored_count()
     }
 
+    /// FFmpeg's `first_field`: the last picture decoded is a field whose
+    /// complementary field has not arrived yet.
+    fn awaiting_second_field(&self) -> bool {
+        match &self.in_progress {
+            Some(p) if p.first_header.field_pic_flag => !self.pending_field.as_ref().is_some_and(|f| {
+                f.is_bottom != p.first_header.bottom_field_flag && f.frame_num == p.first_header.frame_num
+            }),
+            Some(_) => false,
+            None => self.pending_field.is_some(),
+        }
+    }
+
+    /// The SPS of the picture being decoded, else the one the last
+    /// slice activated: what `output_video_dimensions` and
+    /// `output_pixel_format` report before the first frame.
+    fn announced_sps(&self) -> Option<&Sps> {
+        self.in_progress.as_ref().map(|p| &p.sps).or_else(|| self.driver.active_sps())
+    }
+
     /// Handle a single emitted driver event.
     fn handle_event(&mut self, ev: Event) -> Result<()> {
         // §7.4.1.2.3 — the partitions of a data-partitioned slice are
@@ -749,6 +814,9 @@ impl H264CodecDecoder {
                 sps,
             } => {
                 self.last_slice = Some(header.clone());
+                if nal_unit_type == 5 {
+                    self.recovery.idr_slice();
+                }
                 // §8.1 — a coded slice of a separate-colour-plane
                 // stream routes to the monochrome sub-decoder of its
                 // §7.4.3 colour_plane_id (unless THIS instance already
@@ -861,6 +929,21 @@ impl H264CodecDecoder {
                 *slot = Some((rbsp, slice_data_cursor));
                 Ok(())
             }
+            // §D.2.8 — a recovery point names the frame from which the
+            // output is correct; FFmpeg withholds the pictures before it.
+            Event::Sei(messages) => {
+                for message in messages.iter().filter(|m| m.payload_type == 6) {
+                    if let Ok(point) = crate::sei::parse_recovery_point(&message.payload) {
+                        self.recovery.recovery_point_sei(point.recovery_frame_cnt);
+                        if let Some(scp) = self.scp.as_mut() {
+                            for sub in scp.subs.iter_mut() {
+                                sub.recovery.recovery_point_sei(point.recovery_frame_cnt);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -910,9 +993,16 @@ impl H264CodecDecoder {
                 header.colour_plane_id
             )));
         }
-        let scp = self
-            .scp
-            .get_or_insert_with(|| Box::new(ScpState::new(&self.codec_id)));
+        let recovery = &self.recovery;
+        let scp = self.scp.get_or_insert_with(|| {
+            let mut scp = Box::new(ScpState::new(&self.codec_id));
+            // The planes start from what this decoder has seen (a
+            // recovery point SEI ahead of the first slice).
+            for sub in scp.subs.iter_mut() {
+                sub.recovery = recovery.clone();
+            }
+            scp
+        });
         // The packet pts belongs to the access unit; the plane-0
         // (luma) sub-decoder stamps it and the merged frame reuses it.
         if plane == 0 {
@@ -958,20 +1048,29 @@ impl H264CodecDecoder {
         };
         for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
             while let Ok(Frame::Video(vf)) = sub.receive_frame() {
-                queue.push_back(vf);
+                // The sub-decoder reports the frame it just returned.
+                queue.push_back((vf, sub.output_video_dimensions(), sub.output_pixel_format()));
             }
         }
         while scp.queues.iter().all(|q| !q.is_empty()) {
-            let y = scp.queues[0].pop_front().expect("checked non-empty");
-            let cb = scp.queues[1].pop_front().expect("checked non-empty");
-            let cr = scp.queues[2].pop_front().expect("checked non-empty");
+            let (y, size, format) = scp.queues[0].pop_front().expect("checked non-empty");
+            let (cb, _, _) = scp.queues[1].pop_front().expect("checked non-empty");
+            let (cr, _, _) = scp.queues[2].pop_front().expect("checked non-empty");
             let mut planes = y.planes;
             // Each sub-decoder emitted a single-plane monochrome frame
             // of identical geometry (all three planes share the SPS).
             planes.extend(cb.planes);
             planes.extend(cr.planes);
-            self.ready
-                .push_back(OutFrame::Ready(VideoFrame { pts: y.pts, planes }));
+            let (width, height) = size.unwrap_or_default();
+            // The plane decoders already withheld what FFmpeg would not
+            // output, so the merged frame goes straight out.
+            self.ready.push_back(OutputPicture {
+                frame: OutFrame::Ready(VideoFrame { pts: y.pts, planes }),
+                width,
+                height,
+                format: separate_planes_format(format),
+                recovered: 0,
+            });
         }
         // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
         // every access unit to carry all three colour planes, so the
@@ -1247,6 +1346,49 @@ impl H264CodecDecoder {
             let poc = derive_poc(&poc_sps, &poc_slice, &mut self.poc_state)
                 .map_err(|e| Error::invalid(format!("h264 POC: {e:?}")))?;
 
+            // FFmpeg reinitialises when a new SPS changes the coded
+            // geometry (h264_slice.c:1097-1108, 1167-1169), forgetting
+            // what had recovered.
+            let geometry = SpsGeometry::of(&sps);
+            if self.last_geometry.as_ref().is_some_and(|g| *g != geometry) {
+                self.recovery.flush_change();
+            }
+            self.last_geometry = Some(geometry);
+            // A complementary second field belongs to the frame its first
+            // field opened, whose first slice sets FFmpeg's pict_type.
+            let first_field = self.pending_field.as_ref().filter(|f| {
+                header.field_pic_flag
+                    && f.is_bottom != header.bottom_field_flag
+                    && f.frame_num == header.frame_num
+            });
+            let (frame_intra, frame_b) = match first_field {
+                Some(f) => (f.frame_intra, f.frame_b),
+                None => (header.slice_type == SliceType::I, header.slice_type == SliceType::B),
+            };
+            let num_reorder_frames = sps
+                .vui
+                .as_ref()
+                .and_then(|v| v.bitstream_restriction.as_ref())
+                .map(|b| b.max_num_reorder_frames);
+            self.recovery.field_start(num_reorder_frames);
+            let recovered = self.recovery.picture_start(
+                header.frame_num,
+                sps.log2_max_frame_num_minus4 + 4,
+                matches!(header.slice_type, SliceType::I | SliceType::SI),
+                is_idr,
+                is_reference,
+            );
+            // FFmpeg estimates the reorder depth once per frame: at a
+            // frame, or at a pair's second field with the pair's POC.
+            let frame_poc = match first_field {
+                Some(f) => Some(f.field_poc.min(poc.pic_order_cnt)),
+                None if header.field_pic_flag => None,
+                None => Some(poc.pic_order_cnt),
+            };
+            if let Some(frame_poc) = frame_poc {
+                self.recovery.frame_output_order(frame_poc, frame_b, num_reorder_frames);
+            }
+
             // §7.4.2.1.1 eq. (7-26) — a PAFF field picture
             // (`field_pic_flag == 1`) is decoded as a half-height picture
             // (`PicHeightInMbs = FrameHeightInMbs / 2`). The in-progress
@@ -1299,6 +1441,9 @@ impl H264CodecDecoder {
                 pps: pps.clone(),
                 any_slice_succeeded: false,
                 ft: use_ft.then(FtPicture::default),
+                recovered,
+                frame_intra,
+                frame_b,
             });
         }
 
@@ -1997,6 +2142,9 @@ impl H264CodecDecoder {
             pps,
             any_slice_succeeded: _,
             ft,
+            mut recovered,
+            frame_intra,
+            frame_b,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -2114,6 +2262,19 @@ impl H264CodecDecoder {
             let adaptive_ops_vec: Option<Vec<RefMmcoOp>> = marking
                 .and_then(|m| m.adaptive_marking.as_ref())
                 .map(|ops| ops.iter().map(slice_mmco_to_ref_mmco).collect());
+            // FFmpeg's marking fails, and skips the heuristic below, when
+            // an MMCO names a short-term picture it does not hold.
+            let mut marking_failed = !is_idr
+                && adaptive_ops_vec.as_deref().is_some_and(|ops| {
+                    crate::recovery::mmco_target_missing(
+                        &self.dpb_entries,
+                        ops,
+                        first_header.field_pic_flag,
+                        first_header.bottom_field_flag,
+                        first_header.frame_num,
+                        sps.log2_max_frame_num_minus4 + 4,
+                    )
+                });
 
             mmco5_triggered = ref_list::perform_marking(
                 &mut self.dpb_entries,
@@ -2175,6 +2336,33 @@ impl H264CodecDecoder {
             // session — unbounded growth, surfaced by the 2026-07-25
             // scheduled-fuzz OOM triage).
             self.prune_ref_store();
+
+            // FFmpeg's heuristic for an unmarked random access point
+            // runs after every reference picture's marking that did not
+            // fail (MMCO target missing, or more references than the
+            // SPS allows), and MMCO 5 forgets its POC history
+            // (h264_refs.c:729-730, 784-799, 815-826).
+            if mmco5_triggered {
+                self.recovery.reset_poc_history();
+            }
+            let short_refs = ref_list::count_ref_units(&self.dpb_entries, RefMarking::ShortTerm);
+            let long_refs = ref_list::count_ref_units(&self.dpb_entries, RefMarking::LongTerm);
+            marking_failed |= short_refs + long_refs > sps.max_num_ref_frames.max(1) as usize;
+            if !marking_failed {
+                let pps_ref_count = (0..256).filter_map(|id| self.driver.pps(id)).fold([0, 0], |[l0, l1], p| {
+                    [
+                        l0.max(p.num_ref_idx_l0_default_active_minus1.saturating_add(1)),
+                        l1.max(p.num_ref_idx_l1_default_active_minus1.saturating_add(1)),
+                    ]
+                });
+                recovered |= self.recovery.marked(&MarkedPicture {
+                    short_refs,
+                    long_refs,
+                    pps_ref_count,
+                    field: first_header.field_pic_flag,
+                    intra: frame_intra,
+                });
+            }
         }
 
         if is_reference {
@@ -2214,7 +2402,7 @@ impl H264CodecDecoder {
         if is_idr || mmco5_triggered {
             self.flush_pending_field();
             for drained in self.output_dpb.flush() {
-                self.ready.push_back(drained.picture);
+                self.release(drained.picture);
             }
             self.output_dpb.reset();
         }
@@ -2267,33 +2455,44 @@ impl H264CodecDecoder {
         // (opposite parity) and the pair is re-interleaved into a single
         // full-height output frame whose POC is the minimum of the two
         // field POCs (§8.2.1 eq. 8-1).
+        let format = sps_pixel_format(&sps);
         if first_header.field_pic_flag {
-            self.handle_field_output(
+            self.handle_field_output(PendingField {
                 pic,
-                first_header.bottom_field_flag,
-                first_header.frame_num,
-                output_poc,
+                is_bottom: first_header.bottom_field_flag,
+                frame_num: first_header.frame_num,
+                field_poc: output_poc,
                 pts,
-                sps.frame_crop_margins(),
-            );
+                crop: sps.frame_crop_margins(),
+                format,
+                recovered,
+                frame_intra,
+                frame_b,
+            });
             return Ok(());
         }
 
         let out = match (&ft_planes, early_vf.take()) {
             (Some(planes), _) => OutFrame::Pending(planes.clone()),
-            (None, Some(vf)) => OutFrame::Ready(vf),
+            (None, Some((vf, _, _))) => OutFrame::Ready(vf),
             (None, None) => {
-                OutFrame::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
+                OutFrame::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()).0)
             }
         };
         let entry = OutputEntry {
-            picture: out,
+            picture: OutputPicture {
+                frame: out,
+                width: sps.cropped_dimensions().0,
+                height: sps.cropped_dimensions().1,
+                format,
+                recovered,
+            },
             pic_order_cnt: output_poc,
             frame_num: first_header.frame_num,
             needed_for_output: true,
         };
         if let Some(bumped) = self.output_dpb.push(entry) {
-            self.ready.push_back(bumped.picture);
+            self.release(bumped.picture);
         }
 
         Ok(())
@@ -2304,55 +2503,48 @@ impl H264CodecDecoder {
     /// opposite parity), interleave the two half-height field pictures
     /// into one full-height output frame and push it to the §C.4 output
     /// DPB. Otherwise hold the field as the pending half of a pair.
-    fn handle_field_output(
-        &mut self,
-        pic: Picture,
-        is_bottom: bool,
-        frame_num: u32,
-        field_poc: i32,
-        pts: Option<i64>,
-        crop: FrameCropMargins,
-    ) {
+    fn handle_field_output(&mut self, field: PendingField) {
         if let Some(prev) = self.pending_field.take() {
             // Complete the pair only when the two fields are genuinely
             // complementary (opposite parity, same frame_num). A second
             // same-parity field, or a field with a different frame_num,
             // means the first field was unpaired — emit it on its own and
             // start a fresh pending pair with the current field.
-            if prev.is_bottom != is_bottom && prev.frame_num == frame_num {
+            if prev.is_bottom != field.is_bottom && prev.frame_num == field.frame_num {
                 let (top, bottom) = if prev.is_bottom {
-                    (&pic, &prev.pic)
+                    (&field.pic, &prev.pic)
                 } else {
-                    (&prev.pic, &pic)
+                    (&prev.pic, &field.pic)
                 };
                 let frame = interleave_fields(top, bottom);
                 // §8.2.1 eq. 8-1 — PicOrderCnt(frame) =
                 // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
-                let frame_poc = prev.field_poc.min(field_poc);
-                let frame_pts = prev.pts.or(pts);
-                let vf = picture_to_video_frame(&frame, frame_pts, crop);
+                let frame_poc = prev.field_poc.min(field.field_poc);
+                let frame_pts = prev.pts.or(field.pts);
+                let (frame, width, height) = picture_to_video_frame(&frame, frame_pts, field.crop);
                 let entry = OutputEntry {
-                    picture: OutFrame::Ready(vf),
+                    picture: OutputPicture {
+                        frame: OutFrame::Ready(frame),
+                        width,
+                        height,
+                        format: field.format,
+                        // FFmpeg's flags belong to the frame both fields
+                        // decode into.
+                        recovered: prev.recovered | field.recovered,
+                    },
                     pic_order_cnt: frame_poc,
-                    frame_num,
+                    frame_num: field.frame_num,
                     needed_for_output: true,
                 };
                 if let Some(bumped) = self.output_dpb.push(entry) {
-                    self.ready.push_back(bumped.picture);
+                    self.release(bumped.picture);
                 }
                 return;
             }
             // Not complementary — flush the orphaned previous field.
             self.emit_unpaired_field(prev);
         }
-        self.pending_field = Some(PendingField {
-            pic,
-            is_bottom,
-            frame_num,
-            field_poc,
-            pts,
-            crop,
-        });
+        self.pending_field = Some(field);
     }
 
     /// Emit a leftover (unpaired) field as a standalone half-height frame,
@@ -2362,15 +2554,24 @@ impl H264CodecDecoder {
     fn emit_unpaired_field(&mut self, field: PendingField) {
         // A lone field is half the frame's height: the vertical
         // cropping margins shrink with it.
-        let vf = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
+        let (frame, width, height) = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let entry = OutputEntry {
-            picture: OutFrame::Ready(vf),
+            picture: OutputPicture { frame: OutFrame::Ready(frame), width, height, format: field.format, recovered: field.recovered },
             pic_order_cnt: field.field_poc,
             frame_num: field.frame_num,
             needed_for_output: true,
         };
         if let Some(bumped) = self.output_dpb.push(entry) {
-            self.ready.push_back(bumped.picture);
+            self.release(bumped.picture);
+        }
+    }
+
+    /// A picture's turn in output order: FFmpeg outputs it only when it
+    /// is recovered ([`Recovery::output`]); `receive_frame` returns what
+    /// passes.
+    fn release(&mut self, picture: OutputPicture) {
+        if self.recovery.output(picture.recovered) {
+            self.ready.push_back(picture);
         }
     }
 
@@ -2399,11 +2600,11 @@ impl H264CodecDecoder {
             // §C.4 bumping semantics — if the new cap is smaller, the
             // excess is pushed to `ready` in POC order.
             let pending = self.output_dpb.flush();
-            let mut new_dpb = DpbOutput::<OutFrame>::new(reorder, buffering);
+            let mut new_dpb = DpbOutput::<OutputPicture>::new(reorder, buffering);
             // Iterate in the POC-ascending order flush() produced.
             for e in pending {
                 if let Some(bumped) = new_dpb.push(e) {
-                    self.ready.push_back(bumped.picture);
+                    self.release(bumped.picture);
                 }
             }
             self.output_dpb = new_dpb;
@@ -2993,6 +3194,7 @@ impl Decoder for H264CodecDecoder {
                     .push_back(Queued::Packet(packet.pts, packet.time_base));
             }
         } else {
+            self.packet_start();
             self.pending_pts = packet.pts;
             self.pending_time_base = packet.time_base;
         }
@@ -3008,29 +3210,28 @@ impl Decoder for H264CodecDecoder {
             // still being reconstructed on the pool holds the queue
             // until it is done (waited for at end of stream).
             if let Some(front) = self.ready.front() {
-                if let OutFrame::Pending(planes) = front {
+                if let OutFrame::Pending(planes) = &front.frame {
                     if planes.is_done().is_none() && !self.eof {
                         return Err(Error::NeedMore);
                     }
-                    let ok = planes.wait_done();
-                    let frame = if ok { planes.take_output() } else { None };
-                    self.ready.pop_front();
-                    return match frame {
-                        Some(vf) => Ok(Frame::Video(vf)),
-                        None => Err(Error::invalid(
-                            "h264: frame-threaded reconstruction of a picture failed",
-                        )),
-                    };
                 }
-                if let Some(OutFrame::Ready(vf)) = self.ready.pop_front() {
-                    return Ok(Frame::Video(vf));
-                }
+                let out = self.ready.pop_front().expect("front exists");
+                self.returned = Some((out.width, out.height, out.format));
+                let frame = match out.frame {
+                    OutFrame::Ready(vf) => Some(vf),
+                    OutFrame::Pending(planes) => {
+                        if planes.wait_done() { planes.take_output() } else { None }
+                    }
+                };
+                return frame.map(Frame::Video).ok_or_else(|| Error::invalid(
+                    "h264: frame-threaded reconstruction of a picture failed"
+                ));
             }
             // Try a conservative bump on the output DPB. Per §C.4 / the
             // `pop_ready` semantics, this only yields a picture when the
             // queue is genuinely over capacity (mid-stream backpressure).
             if let Some(bumped) = self.output_dpb.pop_ready() {
-                self.ready.push_back(bumped.picture);
+                self.release(bumped.picture);
                 continue;
             }
             // EOF: drain everything remaining in POC-ascending order
@@ -3041,7 +3242,7 @@ impl Decoder for H264CodecDecoder {
                     return Err(Error::Eof);
                 }
                 for e in drained {
-                    self.ready.push_back(e.picture);
+                    self.release(e.picture);
                 }
                 continue;
             }
@@ -3067,9 +3268,39 @@ impl Decoder for H264CodecDecoder {
         self.ft_shutdown();
         self.reset_inner()
     }
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        match self.returned {
+            Some((width, height, _)) => Some((width, height)).filter(|&(w, h)| w > 0 && h > 0),
+            None => self.announced_sps().map(Sps::cropped_dimensions).filter(|&(w, h)| w > 0 && h > 0),
+        }
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        match self.returned {
+            Some((_, _, format)) => format,
+            None => self.announced_sps().and_then(|sps| {
+                let format = sps_pixel_format(sps);
+                if sps.separate_colour_plane_flag {
+                    separate_planes_format(format)
+                } else {
+                    format
+                }
+            }),
+        }
+    }
 }
 
 impl H264CodecDecoder {
+    fn packet_start(&mut self) {
+        let awaiting = self.awaiting_second_field();
+        self.recovery.packet_start(awaiting);
+        if let Some(scp) = self.scp.as_mut() {
+            for sub in &mut scp.subs {
+                let awaiting = sub.awaiting_second_field();
+                sub.recovery.packet_start(awaiting);
+            }
+        }
+    }
     /// Handle one parsed NAL event — directly, or (frame threading)
     /// queued behind the slice-data parses running ahead on the pool.
     fn dispatch_event(&mut self, ev: Event) {
@@ -3143,6 +3374,7 @@ impl H264CodecDecoder {
                 Queued::Packet(pts, tb) => {
                     self.pending_pts = pts;
                     self.pending_time_base = tb;
+                    self.packet_start();
                 }
                 Queued::Event(ev, task) => {
                     if task.is_some() {
@@ -3262,7 +3494,7 @@ impl H264CodecDecoder {
                 ) {
                     drop(ftp);
                     drop(grid);
-                    let vf = picture_to_video_frame(&samples, pts, crop);
+                    let vf = picture_to_video_frame(&samples, pts, crop).0;
                     planes.finish(Some(vf));
                 } else {
                     planes.abort();
@@ -3360,6 +3592,11 @@ impl H264CodecDecoder {
         self.last_slice = None;
         self.decode_errors = 0;
         self.eof = false;
+        // A seek forgets what had recovered (h264_decode_flush), and the
+        // frame last returned no longer describes the output.
+        self.recovery.seek();
+        self.last_geometry = None;
+        self.returned = None;
         // §C.4 — wipe the output queue and any picture that was
         // already bumped but not yet consumed.
         self.output_dpb.reset();
@@ -3381,6 +3618,7 @@ impl H264CodecDecoder {
         self.scp = None;
         Ok(())
     }
+
 }
 
 /// §8.4.1.2.3 — snapshot the per-4x4-block motion data from the
@@ -3491,10 +3729,11 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 ///   `oxideav_core::PixelFormat`: little-endian u16 packed two bytes
 ///   per sample.
 ///
-/// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
-/// format / resolution / time_base live on the stream's
-/// [`CodecParameters`] (set by the decoder from the SPS).
-fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargins) -> VideoFrame {
+/// The slim `VideoFrame` shape only carries `pts` + `planes`; the
+/// visible size this returns alongside the frame (and the pixel format
+/// [`sps_pixel_format`] derives) reach the caller through
+/// [`Decoder::output_video_dimensions`] / [`Decoder::output_pixel_format`].
+fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargins) -> (VideoFrame, u32, u32) {
     let w = pic.width_in_samples as usize;
     let h = pic.height_in_samples as usize;
     let cw = pic.chroma_width() as usize;
@@ -3572,7 +3811,82 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
         }
     }
 
-    VideoFrame { pts, planes }
+    (VideoFrame { pts, planes }, out_w as u32, out_h as u32)
+}
+
+/// The [`PixelFormat`] of the frames a picture decoded with `sps`
+/// becomes (`picture_to_video_frame` layout): the luma plane alone for
+/// 4:0:0 (each colour plane of a separate-colour-plane stream decodes as
+/// one), 16-bit little-endian samples above 8 bits, and the full-range
+/// (`J`) variants FFmpeg's `get_pixel_format` picks for 8-bit video
+/// whose VUI signals `video_full_range_flag`. `None` for depths
+/// [`PixelFormat`] has no variant for and for luma and chroma depths
+/// that differ.
+fn sps_pixel_format(sps: &Sps) -> Option<PixelFormat> {
+    let depth = sps.bit_depth_luma_minus8 + 8;
+    let chroma = sps.chroma_array_type();
+    if chroma != 0 && sps.bit_depth_chroma_minus8 + 8 != depth {
+        return None;
+    }
+    let full_range = sps
+        .vui
+        .as_ref()
+        .and_then(|v| v.video_signal_type.as_ref())
+        .is_some_and(|s| s.video_full_range_flag);
+    use PixelFormat::*;
+    Some(match (chroma, depth) {
+        (0, 8) => Gray8,
+        (0, 10) => Gray10Le,
+        (0, 12) => Gray12Le,
+        (1, 8) if full_range => YuvJ420P,
+        (1, 8) => Yuv420P,
+        (2, 8) if full_range => YuvJ422P,
+        (2, 8) => Yuv422P,
+        (3, 8) if full_range => YuvJ444P,
+        (3, 8) => Yuv444P,
+        (1, 10) => Yuv420P10Le,
+        (2, 10) => Yuv422P10Le,
+        (3, 10) => Yuv444P10Le,
+        (1, 12) => Yuv420P12Le,
+        (2, 12) => Yuv422P12Le,
+        (3, 12) => Yuv444P12Le,
+        _ => return None,
+    })
+}
+
+/// The separate-colour-plane counterpart of [`sps_pixel_format`]: the 4:4:4
+/// format whose planes are three of the monochrome `plane` format.
+fn separate_planes_format(plane: Option<PixelFormat>) -> Option<PixelFormat> {
+    Some(match plane? {
+        PixelFormat::Gray8 => PixelFormat::Yuv444P,
+        PixelFormat::Gray10Le => PixelFormat::Yuv444P10Le,
+        PixelFormat::Gray12Le => PixelFormat::Yuv444P12Le,
+        _ => return None,
+    })
+}
+
+/// What FFmpeg's decoder reinitialises on when a new SPS changes it
+/// (h264_slice.c:1097-1108): the coded size in macroblocks, the chroma
+/// format, the luma bit depth and the sample aspect ratio.
+#[derive(Clone, PartialEq, Eq)]
+struct SpsGeometry {
+    width_in_mbs: u32,
+    height_in_mbs: u32,
+    chroma_format_idc: u32,
+    bit_depth_luma: u32,
+    aspect_ratio: Option<crate::vui::AspectRatioInfo>,
+}
+
+impl SpsGeometry {
+    fn of(sps: &Sps) -> Self {
+        Self {
+            width_in_mbs: sps.pic_width_in_mbs(),
+            height_in_mbs: sps.frame_height_in_mbs(),
+            chroma_format_idc: sps.chroma_format_idc,
+            bit_depth_luma: sps.bit_depth_luma_minus8 + 8,
+            aspect_ratio: sps.vui.as_ref().and_then(|v| v.aspect_ratio.clone()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3595,15 +3909,21 @@ mod tests {
     use super::*;
     use crate::dpb_output::OutputEntry;
 
-    /// Build a tiny VideoFrame so tests can track individual pictures
-    /// without carrying real pixel data.
-    fn vf(tag: u8) -> VideoFrame {
-        VideoFrame {
-            pts: None,
-            planes: vec![VideoPlane {
-                stride: 1,
-                data: vec![tag],
-            }],
+    /// Build a tiny recovered picture (as after an IDR) so tests can
+    /// track individual pictures without carrying real pixel data.
+    fn vf(tag: u8) -> OutputPicture {
+        OutputPicture {
+            frame: OutFrame::Ready(VideoFrame {
+                pts: None,
+                planes: vec![VideoPlane {
+                    stride: 1,
+                    data: vec![tag],
+                }],
+            }),
+            width: 1,
+            height: 1,
+            format: Some(PixelFormat::Gray8),
+            recovered: crate::recovery::RECOVERED_IDR,
         }
     }
 
@@ -3618,7 +3938,7 @@ mod tests {
 
     fn push_entry(dec: &mut H264CodecDecoder, tag: u8, poc: i32, frame_num: u32) {
         let entry = OutputEntry {
-            picture: OutFrame::Ready(vf(tag)),
+            picture: vf(tag),
             pic_order_cnt: poc,
             frame_num,
             needed_for_output: true,
@@ -3657,7 +3977,7 @@ mod tests {
     #[test]
     fn reorder_with_small_dpb_matches_conservative_bumping() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<OutFrame>::new(2, 3);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(2, 3);
 
         push_entry(&mut dec, 10, 0, 0); // IDR
         push_entry(&mut dec, 11, 4, 1); // P
@@ -3684,7 +4004,7 @@ mod tests {
         // Cap = 5 ≥ number of pictures → nothing bumps mid-stream,
         // every picture goes through the end-of-stream flush in POC
         // order.
-        dec.output_dpb = DpbOutput::<OutFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(5, 5);
 
         // Same IPBBB decode order as above.
         push_entry(&mut dec, 10, 0, 0); // IDR
@@ -3721,7 +4041,7 @@ mod tests {
     #[test]
     fn flush_at_eof_drains_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<OutFrame>::new(8, 8);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(8, 8);
 
         // Decode order: [POC 3, POC 1, POC 2] — nothing bumped mid-stream
         // because we stay below capacity.
@@ -3770,7 +4090,7 @@ mod tests {
     #[test]
     fn idr_drains_pending_pictures_in_poc_order() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<OutFrame>::new(4, 4);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(4, 4);
 
         // Sequence 1: POCs 0, 4, 2, 1 — four frames queued, none bumped.
         push_entry(&mut dec, 1, 0, 0);
@@ -3803,7 +4123,7 @@ mod tests {
     #[test]
     fn reset_clears_output_dpb_and_ready() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.output_dpb = DpbOutput::<OutFrame>::new(2, 2);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(2, 2);
         // Fill + overflow so one entry lands in `ready`.
         push_entry(&mut dec, 1, 0, 0);
         push_entry(&mut dec, 2, 1, 1);
@@ -3956,7 +4276,7 @@ mod tests {
     fn b_pyramid_emits_in_poc_order_at_level_31_720p() {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Mirror what the production fix derives for level 3.1 720p.
-        dec.output_dpb = DpbOutput::<OutFrame>::new(5, 5);
+        dec.output_dpb = DpbOutput::<OutputPicture>::new(5, 5);
 
         // Decode order, with (tag = display_index + 1, POC).
         push_entry(&mut dec, 1, 0, 0); // I0   display 0
@@ -4258,6 +4578,9 @@ mod tests {
             pps: test_pps(),
             any_slice_succeeded: true,
             ft: None,
+            recovered: 0,
+            frame_intra: false,
+            frame_b: false,
         });
     }
 
@@ -4690,6 +5013,30 @@ mod tests {
         p
     }
 
+    /// A finalized field as `finalize_in_progress_picture` hands it to
+    /// `handle_field_output` (recovered, as after an IDR).
+    fn field(
+        pic: Picture,
+        is_bottom: bool,
+        frame_num: u32,
+        field_poc: i32,
+        pts: Option<i64>,
+        crop: FrameCropMargins,
+    ) -> PendingField {
+        PendingField {
+            pic,
+            is_bottom,
+            frame_num,
+            field_poc,
+            pts,
+            crop,
+            format: Some(PixelFormat::Yuv420P),
+            recovered: crate::recovery::RECOVERED_IDR,
+            frame_intra: true,
+            frame_b: false,
+        }
+    }
+
     #[test]
     fn interleave_fields_places_top_on_even_bottom_on_odd_rows() {
         // 16-wide, 2-MB-tall field → 32 field rows each, 64 frame rows.
@@ -4731,13 +5078,13 @@ mod tests {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top, false, 3, 8, Some(99), FrameCropMargins::default());
+        dec.handle_field_output(field(top, false, 3, 8, Some(99), FrameCropMargins::default()));
         // The first field alone produces no output (held pending).
         assert!(dec.ready.is_empty());
         assert!(dec.pending_field.is_some());
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
-        dec.handle_field_output(bottom, true, 3, 10, None, FrameCropMargins::default());
+        dec.handle_field_output(field(bottom, true, 3, 10, None, FrameCropMargins::default()));
         // Pair completed → pending cleared, one frame queued (possibly
         // still inside the output DPB until bumped). Force a drain.
         assert!(dec.pending_field.is_none());
@@ -4767,9 +5114,9 @@ mod tests {
         // Two consecutive TOP fields (same parity) → not a pair. The
         // first must be emitted on its own, the second held pending.
         let top1 = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(top1, false, 3, 8, None, FrameCropMargins::default());
+        dec.handle_field_output(field(top1, false, 3, 8, None, FrameCropMargins::default()));
         let top2 = field_pic(16, 4, 50, 128, 12, 4);
-        dec.handle_field_output(top2, false, 4, 12, None, FrameCropMargins::default());
+        dec.handle_field_output(field(top2, false, 4, 12, None, FrameCropMargins::default()));
         // First top field orphaned → one half-height frame queued; the
         // second top field is now pending.
         assert!(dec.pending_field.is_some());
@@ -4805,7 +5152,8 @@ mod tests {
             top: 2,
             bottom: 6,
         };
-        let vf = picture_to_video_frame(&pic, Some(1), crop);
+        let (vf, width, height) = picture_to_video_frame(&pic, Some(1), crop);
+        assert_eq!((width, height), (26, 24));
         assert_eq!(vf.planes.len(), 3);
         let (w, h) = (26usize, 24usize);
         assert_eq!(vf.planes[0].stride, w);
@@ -4843,7 +5191,8 @@ mod tests {
             top: 0,
             bottom: 2,
         };
-        let vf = picture_to_video_frame(&pic, None, crop);
+        let (vf, width, height) = picture_to_video_frame(&pic, None, crop);
+        assert_eq!((width, height), (10, 14));
         assert_eq!(vf.planes.len(), 1);
         assert_eq!(vf.planes[0].stride, 20);
         assert_eq!(vf.planes[0].data.len(), 20 * 14);
@@ -4862,18 +5211,22 @@ mod tests {
             bottom: 4,
         };
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.handle_field_output(field_pic(16, 4, 30, 128, 8, 3), false, 3, 8, None, crop);
-        dec.handle_field_output(field_pic(16, 4, 40, 128, 10, 3), true, 3, 10, None, crop);
+        dec.handle_field_output(field(field_pic(16, 4, 30, 128, 8, 3), false, 3, 8, None, crop));
+        dec.handle_field_output(field(field_pic(16, 4, 40, 128, 10, 3), true, 3, 10, None, crop));
         // An orphan top field (next frame_num), flushed at EOF.
-        dec.handle_field_output(field_pic(16, 4, 50, 128, 12, 4), false, 4, 12, None, crop);
+        dec.handle_field_output(field(field_pic(16, 4, 50, 128, 12, 4), false, 4, 12, None, crop));
         dec.flush_pending_field();
         dec.eof = true;
         let mut sizes = Vec::new();
         while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            sizes.push((
-                vf.planes[0].stride,
-                vf.planes[0].data.len() / vf.planes[0].stride,
-            ));
+            let size = (vf.planes[0].stride, vf.planes[0].data.len() / vf.planes[0].stride);
+            // The decoder reports the visible size of the frame it just
+            // returned.
+            assert_eq!(
+                dec.output_video_dimensions(),
+                Some((size.0 as u32, size.1 as u32))
+            );
+            sizes.push(size);
             assert_eq!(vf.planes[1].stride, 7);
         }
         // Pair: 8 rows − 4; lone field: 4 rows − 2.

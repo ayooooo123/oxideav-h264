@@ -311,7 +311,7 @@ impl DpbEntry {
     }
 
     /// True when any decoded field of this entry carries marking `m`.
-    fn any_field_is(&self, m: RefMarking) -> bool {
+    pub(crate) fn any_field_is(&self, m: RefMarking) -> bool {
         [FieldParity::Top, FieldParity::Bottom]
             .into_iter()
             .any(|p| self.has_field(p) && self.field_marking(p) == m)
@@ -1305,6 +1305,15 @@ fn ref_units(dpb: &[DpbEntry]) -> Vec<Vec<usize>> {
         units.push(unit);
     }
     units
+}
+
+/// How many reference units (see [`ref_units`]) have a field marked
+/// `m`: FFmpeg's `short_ref_count` / `long_ref_count`.
+pub(crate) fn count_ref_units(dpb: &[DpbEntry], m: RefMarking) -> usize {
+    ref_units(dpb)
+        .iter()
+        .filter(|unit| unit.iter().any(|&i| dpb[i].any_field_is(m)))
+        .count()
 }
 
 /// §8.2.4.2.1 / §8.2.4.2.3 — the two stored coded-field halves behind a
