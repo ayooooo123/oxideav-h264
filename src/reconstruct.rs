@@ -102,13 +102,6 @@ pub enum ReconstructError {
     /// list resolves to an uninitialised DPB slot.
     #[error("inter MC against zero-dim reference picture (width={width}, height={height})")]
     InvalidRefDims { width: u32, height: u32 },
-    /// §8.2.5.2 — the resolved reference is a synthesised "non-existing"
-    /// frame (frame_num-gap placeholder). Its samples are "not available
-    /// for prediction of other pictures"; a bitstream whose inter
-    /// prediction samples one is non-conforming, and reconstructing from
-    /// the placeholder would silently fabricate picture content.
-    #[error("inter MC against a non-existing (frame_num-gap) reference picture (§8.2.5.2)")]
-    NonExistingRef,
     /// §8.3.1.2 / §8.3.2.2 / §8.3.3 / §8.3.4 — the bitstream requested
     /// an intra prediction mode whose required neighbour samples are
     /// marked "not available for Intra prediction". Every non-DC mode
@@ -5759,13 +5752,6 @@ fn mc_luma_partition(
             width: ref_pic.width_in_samples,
             height: ref_pic.height_in_samples,
         });
-    }
-    // §8.2.5.2 — refuse to sample a synthesised "non-existing"
-    // reference (see `ReconstructError::NonExistingRef`). Every inter
-    // partition motion-compensates luma, so this single gate covers the
-    // chroma paths as well.
-    if ref_pic.non_existing {
-        return Err(ReconstructError::NonExistingRef);
     }
     // §8.4.1.4 — MV is in 1/4-pel luma units. Integer part = mv / 4
     // (with spec's "truncate toward zero" via i32 division); fractional

@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (PearTube fork)
 
+- decoder: a stream entered at a non-IDR picture (a seek, a cut, a lost
+  picture) decodes as FFmpeg 2da55bf does (LGPL ports):
+  - frame_num gaps (h264_slice.c `h264_field_start`): before every
+    non-IDR picture, whether or not the SPS allows gaps, missing
+    frame_nums become short-term gap frames, at most `max_num_ref_frames`
+    of them; each copies the newest short-term reference (POC + 2) or,
+    with none, is gray (flagged gray while nothing has recovered). FFmpeg's
+    `prev_frame_num` starts at −1, so entering at an I frame with
+    frame_num N makes N gap frames (capped), which the unmarked random
+    access heuristic counts. Gap frames made while the SPS does not allow
+    gaps are dropped once `max_num_ref_frames` frame_nums old. The §7.4.3
+    frame_num check that refused every later picture after one failed
+    reference picture is gone, and gap frames are no longer refused as
+    references.
+  - missing references (h264_refs.c `ff_h264_build_ref_list`): an active
+    list entry the DPB cannot supply takes the list's default reference
+    (its initial first entry); a modification naming a missing picture
+    clears its entry instead of shifting the list; with `noref_gray`, a
+    gray entry takes the first non-gray default once an I slice was
+    decoded. A P or B picture is gray when its lists keep a gray entry.
+  - output decisions (h264_slice.c `h264_select_output_frame`): the
+    decoder keeps FFmpeg's `delayed_pic` alongside its §C.4 output and
+    takes each frame's recovered/shown decision when FFmpeg takes the
+    frame out, at a later frame's start, so `frame_recovered` changes at
+    FFmpeg's moment; frames FFmpeg drops as out of order are withheld.
+  - `h264_decoder::video_delay`: FFmpeg's `codecpar->video_delay` for H.264
+    parameters (the `video_delay` option, else the SPS VUI
+    `max_num_reorder_frames`), for seeking as fftools does.
+
+  Entered at the 2 s I frame of an x264 open-GOP stream without recovery
+  point SEIs, 148 of 148 frames equal FFmpeg's (before: one frame, then
+  every slice refused); at its 4 s I frame no frame is output, as in
+  FFmpeg (before: 93).
+
 - decoder: pictures FFmpeg 2da55bf does not output are withheld
   (`src/recovery.rs`, LGPL port): a picture is recovered at an IDR, at
   the frame a recovery point SEI names, or at an unmarked random access

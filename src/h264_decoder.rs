@@ -43,7 +43,7 @@
 //! this decoder (via [`crate::register`]) stops the "codec not found"
 //! error on the first h264 packet.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -80,6 +80,9 @@ struct OutputPicture {
     format: Option<PixelFormat>,
     /// `crate::recovery::RECOVERED_*` bits.
     recovered: u8,
+    /// The frame's id in [`Recovery::select_output`]; `None` for a frame
+    /// FFmpeg's `delayed_pic` never held (a lone field).
+    id: Option<u32>,
 }
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
@@ -165,6 +168,13 @@ struct PictureInProgress {
     /// field) is an I slice / a B slice: FFmpeg's `pict_type`.
     frame_intra: bool,
     frame_b: bool,
+    /// FFmpeg's `gray` for the picture, as its latest slice decided
+    /// (h264_slice.c `h264_slice_init`): false for an I slice, else
+    /// whether a reference the slice's lists hold is gray.
+    gray: bool,
+    /// Id of the frame in [`Recovery::select_output`]: given at a frame
+    /// or a pair's second field, `None` for a first field.
+    output_id: Option<u32>,
 }
 
 /// §C.4.4 — a decoded PAFF field awaiting its complementary field so the
@@ -196,6 +206,10 @@ struct PendingField {
     /// The field's first slice is an I slice / a B slice.
     frame_intra: bool,
     frame_b: bool,
+    /// The field is an IDR picture (FFmpeg's key frame flag).
+    idr: bool,
+    /// See [`PictureInProgress::output_id`].
+    output_id: Option<u32>,
 }
 
 /// §8.1 — separate-colour-plane decode state (round 448). When the
@@ -250,6 +264,51 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         dec.consume_extradata(&params.extradata)?;
     }
     Ok(Box::new(dec))
+}
+
+/// FFmpeg's `codecpar->video_delay` for an H.264 stream, as its
+/// `avformat_find_stream_info` leaves it (the probing decoder's
+/// `has_b_frames`), when the parameters tell:
+///
+/// * the demuxer's own value, the codec option `video_delay` (demuxers that
+///   port find_stream_info set it);
+/// * else the reorder depth the first SPS in the extradata (avcC or Annex
+///   B) declares: its VUI `max_num_reorder_frames`, which FFmpeg's decoder
+///   adopts at the first slice when `bitstream_restriction_flag` is set
+///   (2da55bf h264_slice.c `h264_init_ps`). A value over 16 fails FFmpeg's
+///   SPS parse (h264_ps.c), so it tells nothing here.
+///
+/// `None` when neither tells: FFmpeg then guesses the depth from the order
+/// of the pictures it decodes while probing.
+///
+/// Players use it as fftools does when seeking: with a delay, `-ss` seeks
+/// 3/23 s early (ffmpeg_demux.c).
+pub fn video_delay(params: &CodecParameters) -> Option<u32> {
+    if let Some(delay) = params
+        .options
+        .get("video_delay")
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        return Some(delay);
+    }
+    let extra = &params.extradata;
+    let first_sps: Option<&[u8]> = if extra.first() == Some(&1) {
+        // avcC: 6-byte header, then the SPS count and the length-prefixed SPSs.
+        let len = usize::from(u16::from_be_bytes([*extra.get(6)?, *extra.get(7)?]));
+        (extra[5] & 0x1f > 0)
+            .then(|| extra.get(8..8 + len))
+            .flatten()
+    } else {
+        crate::nal::AnnexBSplitter::new(extra)
+            .find(|nal| nal.first().is_some_and(|h| h & 0x1f == 7))
+    };
+    let rbsp = crate::nal::rbsp_from_nal_payload(first_sps?.get(1..)?);
+    let reorder = Sps::parse(&rbsp)
+        .ok()?
+        .vui?
+        .bitstream_restriction?
+        .max_num_reorder_frames;
+    (reorder <= 16).then_some(reorder)
 }
 
 /// Full per-slice decoder with DPB wiring.
@@ -347,16 +406,21 @@ pub struct H264CodecDecoder {
     /// For the §8.2.1.1 MMCO-5 hint — the previous reference
     /// picture's `TopFieldOrderCnt`, used only when `prev_had_mmco5`.
     prev_reference_top_foc: i32,
-    /// §8.2.5.2 — `PrevRefFrameNum` kept for the gap-in-frame_num
-    /// detection / non-existing reference-frame synthesis. Holds the
-    /// `frame_num` of the most recent *reference* picture decoded in
-    /// the current coded video sequence. Reset on IDR.
-    ///
-    /// When the next picture arrives with `frame_num` not equal to
-    /// `(prev_ref_frame_num + 1) mod MaxFrameNum`, the spec §8.2.5.2
-    /// procedure inserts synthetic "non-existing" short-term reference
-    /// frames for each missing `frame_num` value.
-    prev_ref_frame_num: Option<u32>,
+    /// FFmpeg's `h->poc.prev_frame_num` (2da55bf): the `frame_num` of the
+    /// previous picture, reference or not; 0 at an IDR picture and after
+    /// MMCO 5; −1 for a new decoder and after a seek, so a stream entered
+    /// at a non-IDR picture opens with a frame_num gap. It decides the gap
+    /// frames [`Self::conceal_frame_num_gap`] makes.
+    ff_prev_frame_num: i32,
+    /// FFmpeg's `h->non_gray`: an I slice was decoded since the decoder
+    /// started or was reset by a seek.
+    non_gray: bool,
+    /// DPB keys of the gap frames FFmpeg marks `invalid_gap` (made while
+    /// the SPS does not allow frame_num gaps); see
+    /// [`Self::prune_invalid_gaps`].
+    invalid_gap_keys: HashSet<u32>,
+    /// The next frame id for [`Recovery::select_output`].
+    next_output_id: u32,
 
     /// §7.4.1.2 / §7.4.1.2.4 — picture currently being assembled across
     /// one-or-more slice NAL units. `None` means no slice of the current
@@ -428,7 +492,10 @@ impl H264CodecDecoder {
             next_dpb_key: 0,
             prev_had_mmco5: false,
             prev_reference_top_foc: 0,
-            prev_ref_frame_num: None,
+            ff_prev_frame_num: -1,
+            non_gray: false,
+            invalid_gap_keys: HashSet::new(),
+            next_output_id: 0,
             in_progress: None,
             pending_field: None,
             scp: None,
@@ -971,6 +1038,7 @@ impl H264CodecDecoder {
                 height,
                 format: separate_planes_format(format),
                 recovered: 0,
+                id: None,
             });
         }
         // Anti-OOM guard for NON-conforming streams: §7.4.1.2 requires
@@ -1186,36 +1254,18 @@ impl H264CodecDecoder {
                 )));
             }
 
-            // §7.4.3 — frame_num discipline. When
-            // `gaps_in_frame_num_value_allowed_flag` is 0 and the
-            // current picture's `frame_num` differs from
-            // `PrevRefFrameNum`, conformance requires `frame_num ==
-            // (PrevRefFrameNum + 1) % MaxFrameNum` exactly. (Equality
-            // with `PrevRefFrameNum` itself is the
-            // second-field / non-reference-following-reference case and
-            // is checked by the §7.4.1.2.4 picture-boundary logic.)
-            if !is_idr && !sps.gaps_in_frame_num_value_allowed_flag {
-                if let Some(prev) = self.prev_ref_frame_num {
-                    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-                    let expected = (prev + 1) % max_frame_num;
-                    if header.frame_num != prev && header.frame_num != expected {
-                        return Err(Error::invalid(format!(
-                            "h264 slice_header: frame_num {} after PrevRefFrameNum {} (§7.4.3 requires {} when gaps_in_frame_num_value_allowed_flag is 0)",
-                            header.frame_num, prev, expected
-                        )));
-                    }
-                }
+            // FFmpeg's frame_num gap handling (2da55bf h264_field_start):
+            // before every non-IDR picture, whether or not the SPS allows
+            // gaps, missing frame_nums become gap frames — a stream entered
+            // mid-sequence, lost pictures, or a coded gap. An IDR picture
+            // starts the count from 0 (h264dec.c `idr`). FFmpeg never
+            // refuses a picture for its frame_num.
+            if is_idr {
+                self.ff_prev_frame_num = 0;
+            } else {
+                self.conceal_frame_num_gap(&sps, header.frame_num);
             }
-
-            // §8.2.5.2 — gaps in frame_num. When the stream signals a
-            // gap (`frame_num != (PrevRefFrameNum + 1) mod MaxFrameNum`)
-            // and the SPS allows gaps, synthesize "non-existing" short-term
-            // reference frames for each missing value to keep the
-            // sliding window + RPLM picNumX arithmetic aligned with the
-            // encoder's view of the DPB.
-            if !is_idr && sps.gaps_in_frame_num_value_allowed_flag {
-                self.fill_frame_num_gap(&sps, header.frame_num)?;
-            }
+            self.ff_prev_frame_num = header.frame_num as i32;
 
             // §8.2.1 — derive POC for this picture. All slices of the
             // same picture will share this value (§7.4.1.2.4).
@@ -1252,7 +1302,10 @@ impl H264CodecDecoder {
             });
             let (frame_intra, frame_b) = match first_field {
                 Some(f) => (f.frame_intra, f.frame_b),
-                None => (header.slice_type == SliceType::I, header.slice_type == SliceType::B),
+                None => (
+                    header.slice_type == SliceType::I,
+                    header.slice_type == SliceType::B,
+                ),
             };
             let num_reorder_frames = sps
                 .vui
@@ -1274,9 +1327,24 @@ impl H264CodecDecoder {
                 None if header.field_pic_flag => None,
                 None => Some(poc.pic_order_cnt),
             };
-            if let Some(frame_poc) = frame_poc {
-                self.recovery.frame_output_order(frame_poc, frame_b, num_reorder_frames);
-            }
+            // FFmpeg's h264_select_output_frame runs there too, deciding
+            // which waiting frame it takes out for output.
+            let output_id = frame_poc.map(|frame_poc| {
+                let invalid_poc =
+                    self.recovery
+                        .frame_output_order(frame_poc, frame_b, num_reorder_frames);
+                let id = self.next_output_id;
+                self.next_output_id = id.wrapping_add(1);
+                let (key, first_flags) = first_field.map_or((false, 0), |f| (f.idr, f.recovered));
+                self.recovery.select_output(
+                    id,
+                    frame_poc,
+                    is_idr || key,
+                    invalid_poc,
+                    recovered | first_flags,
+                );
+                id
+            });
 
             // §7.4.2.1.1 eq. (7-26) — a PAFF field picture
             // (`field_pic_flag == 1`) is decoded as a half-height picture
@@ -1332,6 +1400,8 @@ impl H264CodecDecoder {
                 recovered,
                 frame_intra,
                 frame_b,
+                gray: false,
+                output_id,
             });
         }
 
@@ -1430,6 +1500,20 @@ impl H264CodecDecoder {
         let mut l0_pair_keys: Vec<Option<(u32, u32)>> = Vec::new();
         let mut l1_pair_keys: Vec<Option<(u32, u32)>> = Vec::new();
         let mut field_pocs_lt: Option<FieldListPocsLt> = None;
+        // FFmpeg's `default_ref`, `noref_gray` and gray tracking (2da55bf
+        // h264_refs.c `ff_h264_build_ref_list`, h264_slice.c
+        // `h264_slice_init`): after the modifications, an active entry
+        // the DPB cannot supply takes the list's default reference (its
+        // initial first entry); once an I slice has been decoded, a gray
+        // entry takes the first non-gray default reference of the lists.
+        // A P or B slice is gray when an entry it keeps is gray.
+        let list_count = match header.slice_type {
+            SliceType::B => 2,
+            SliceType::P | SliceType::SP => 1,
+            SliceType::I | SliceType::SI => 0,
+        };
+        let non_gray = self.non_gray;
+        let mut slice_gray = false;
         let (list0, list1) = if is_idr {
             (Vec::new(), Vec::new())
         } else if current_is_field {
@@ -1451,6 +1535,7 @@ impl H264CodecDecoder {
                 ),
                 SliceType::I | SliceType::SI => (Vec::new(), Vec::new()),
             };
+            let defaults = [fl0.first().copied(), fl1.first().copied()];
             // §8.2.4 — same all-'no reference picture' refusal as the
             // frame path below.
             if header.slice_type.has_list_0() && fl0.is_empty() {
@@ -1493,6 +1578,28 @@ impl H264CodecDecoder {
                     current_bottom,
                 );
             }
+            let is_gray = |e: &ref_list::RefFieldEntry| {
+                self.ref_store.get_by_key(e.dpb_key).is_some_and(|p| p.gray)
+            };
+            for li in 0..list_count {
+                let list = if li == 0 { &mut fl0 } else { &mut fl1 };
+                for entry in list.iter_mut() {
+                    if entry.dpb_key == u32::MAX {
+                        *entry = defaults[li].ok_or_else(|| {
+                            Error::invalid("h264: missing reference picture without a default")
+                        })?;
+                    }
+                    if non_gray && is_gray(entry) {
+                        if let Some(d) = (0..list_count)
+                            .map(|j| (li + j) & 1)
+                            .find_map(|l2| defaults[l2].filter(|d| !is_gray(d)))
+                        {
+                            *entry = d;
+                        }
+                    }
+                }
+            }
+            slice_gray = fl0.iter().chain(&fl1).any(is_gray);
             let r0 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl0);
             let r1 = Self::resolve_field_list(&self.dpb_entries, &self.ref_store, &fl1);
             l0_overrides = r0.overrides;
@@ -1536,6 +1643,7 @@ impl H264CodecDecoder {
                 ),
                 SliceType::I | SliceType::SI => (Vec::new(), Vec::new()),
             };
+            let defaults = [l0.first().copied(), l1.first().copied()];
 
             // §8.2.4 — an inter-predicted (P/SP/B) slice with NO usable
             // reference picture in the DPB at all. §8.2.4.2.1 pads a
@@ -1592,6 +1700,31 @@ impl H264CodecDecoder {
                     current_bottom,
                 );
             }
+            let is_gray = |key: u32| match pairings.iter().find(|p| p.unit_key == key) {
+                Some(p) => [p.top_key, p.bottom_key]
+                    .iter()
+                    .any(|&k| self.ref_store.get_by_key(k).is_some_and(|pic| pic.gray)),
+                None => self.ref_store.get_by_key(key).is_some_and(|pic| pic.gray),
+            };
+            for li in 0..list_count {
+                let list = if li == 0 { &mut l0 } else { &mut l1 };
+                for key in list.iter_mut() {
+                    if *key == u32::MAX {
+                        *key = defaults[li].ok_or_else(|| {
+                            Error::invalid("h264: missing reference picture without a default")
+                        })?;
+                    }
+                    if non_gray && is_gray(*key) {
+                        if let Some(d) = (0..list_count)
+                            .map(|j| (li + j) & 1)
+                            .find_map(|l2| defaults[l2].filter(|&d| !is_gray(d)))
+                        {
+                            *key = d;
+                        }
+                    }
+                }
+            }
+            slice_gray = l0.iter().chain(&l1).any(|&k| is_gray(k));
 
             // §8.4.2.1 — resolve each unit key: a complementary-pair
             // unit materialises the full-height reference frame by
@@ -1660,6 +1793,12 @@ impl H264CodecDecoder {
 
             (l0, l1)
         };
+        if list_count == 0 {
+            in_progress.gray = false;
+            self.non_gray = true;
+        } else {
+            in_progress.gray = slice_gray;
+        }
 
         // §8.4.* — pixel reconstruction into the in-progress picture.
         // Stamp the current picture's POC + frame_num so §8.4.1.2.3
@@ -1970,6 +2109,8 @@ impl H264CodecDecoder {
             mut recovered,
             frame_intra,
             frame_b,
+            gray,
+            output_id,
         } = in_progress;
 
         // §8.4.1.2.3 temporal direct needs the colocated block's MVs
@@ -1978,6 +2119,7 @@ impl H264CodecDecoder {
         // forward. Idempotent: overwrites whatever was in the Picture
         // before.
         snapshot_grid_into_picture(&mut pic, &grid);
+        pic.gray = gray;
 
         // SPS and PPS were snapshotted at the first slice's header-parse
         // time (via [`Event::Slice`]). Using the driver's current
@@ -2096,7 +2238,9 @@ impl H264CodecDecoder {
             }
 
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
+            let marked_frame_num = current_entry.frame_num;
             self.dpb_entries.push(current_entry);
+            self.prune_invalid_gaps(marked_frame_num, &sps);
             // §8.2.5 — pictures the marking pass just evicted can never
             // be referenced again; release their samples so store
             // memory stays bounded by the DPB size (round 430: the
@@ -2111,7 +2255,7 @@ impl H264CodecDecoder {
             // SPS allows), and MMCO 5 forgets its POC history
             // (h264_refs.c:729-730, 784-799, 815-826).
             if mmco5_triggered {
-                self.recovery.reset_poc_history();
+                self.recovery.mmco5(output_id);
             }
             let short_refs = ref_list::count_ref_units(&self.dpb_entries, RefMarking::ShortTerm);
             let long_refs = ref_list::count_ref_units(&self.dpb_entries, RefMarking::LongTerm);
@@ -2132,6 +2276,9 @@ impl H264CodecDecoder {
                 });
             }
         }
+        if let Some(id) = output_id {
+            self.recovery.add_flags(id, recovered);
+        }
 
         if is_reference {
             self.prev_had_mmco5 = mmco5_triggered;
@@ -2143,18 +2290,12 @@ impl H264CodecDecoder {
             } else {
                 0
             };
-            // §8.2.5.2 — remember this reference picture's `frame_num`
-            // so the next access unit can detect (and fill) any gap.
-            // MMCO-5 resets the CVS, so `prev_ref_frame_num` is cleared
-            // per §8.2.1 NOTE 1 / §8.2.5.4.5.
-            self.prev_ref_frame_num = if mmco5_triggered {
-                // Per §8.2.5.4.5 the picture that carried MMCO 5 is
-                // renumbered to frame_num 0; treat its successor as if
-                // it were the frame after frame_num 0.
-                Some(0)
-            } else {
-                Some(first_header.frame_num)
-            };
+            // MMCO 5 renumbers the picture to frame_num 0 (FFmpeg sets
+            // `h->poc.frame_num` to 0, h264_refs.c), so the next picture's
+            // gap check counts from 0.
+            if mmco5_triggered {
+                self.ff_prev_frame_num = 0;
+            }
         }
 
         // `time_base` was previously stamped onto the VideoFrame for
@@ -2221,13 +2362,22 @@ impl H264CodecDecoder {
                 recovered,
                 frame_intra,
                 frame_b,
+                idr: is_idr,
+                output_id,
             });
             return Ok(());
         }
 
         let (frame, width, height) = picture_to_video_frame(&pic, pts, sps.frame_crop_margins());
         let entry = OutputEntry {
-            picture: OutputPicture { frame, width, height, format, recovered },
+            picture: OutputPicture {
+                frame,
+                width,
+                height,
+                format,
+                recovered,
+                id: output_id,
+            },
             pic_order_cnt: output_poc,
             frame_num: first_header.frame_num,
             needed_for_output: true,
@@ -2272,6 +2422,7 @@ impl H264CodecDecoder {
                         // FFmpeg's flags belong to the frame both fields
                         // decode into.
                         recovered: prev.recovered | field.recovered,
+                        id: field.output_id.or(prev.output_id),
                     },
                     pic_order_cnt: frame_poc,
                     frame_num: field.frame_num,
@@ -2297,7 +2448,14 @@ impl H264CodecDecoder {
         // cropping margins shrink with it.
         let (frame, width, height) = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let entry = OutputEntry {
-            picture: OutputPicture { frame, width, height, format: field.format, recovered: field.recovered },
+            picture: OutputPicture {
+                frame,
+                width,
+                height,
+                format: field.format,
+                recovered: field.recovered,
+                id: field.output_id,
+            },
             pic_order_cnt: field.field_poc,
             frame_num: field.frame_num,
             needed_for_output: true,
@@ -2308,10 +2466,10 @@ impl H264CodecDecoder {
     }
 
     /// A picture's turn in output order: FFmpeg outputs it only when it
-    /// is recovered ([`Recovery::output`]); `receive_frame` returns what
-    /// passes.
+    /// is recovered, as decided when FFmpeg took it from `delayed_pic`
+    /// ([`Recovery::shows`]); `receive_frame` returns what passes.
     fn release(&mut self, picture: OutputPicture) {
-        if self.recovery.output(picture.recovered) {
+        if self.recovery.shows(picture.id, picture.recovered) {
             self.ready.push_back(picture);
         }
     }
@@ -2369,90 +2527,86 @@ impl H264CodecDecoder {
     fn prune_ref_store(&mut self) {
         let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
         self.ref_store.retain_keys(&live);
+        self.invalid_gap_keys.retain(|k| live.contains(k));
     }
 
-    /// §8.2.5.2 — synthesise "non-existing" short-term reference frames
-    /// to fill a gap between `PrevRefFrameNum` and the current picture's
-    /// `frame_num`. Each synthetic frame advances the sliding-window
-    /// eviction state (§8.2.5.3) and the POC-state `prev_frame_num` for
-    /// `pic_order_cnt_type` 1/2, matching the encoder's assumption that
-    /// those references exist in the DPB when it emits RPLM / MMCO ops
-    /// targeting their PicNum values.
+    /// FFmpeg's frame_num gap handling (2da55bf h264_slice.c
+    /// `h264_field_start`, lines 1450-1466 and 1525-1601), before every
+    /// non-IDR picture:
     ///
-    /// The synthetic picture's pixel samples are marked "not available
-    /// for prediction of other pictures" per §8.2.5.2; we still insert
-    /// a placeholder [`Picture`] in the ref store so any erroneous
-    /// motion-compensation reference produces neutral (gray) output
-    /// rather than a crash. Conformant streams do not actually sample
-    /// a non-existing reference's pixels.
-    fn fill_frame_num_gap(&mut self, sps: &Sps, current_frame_num: u32) -> Result<()> {
-        let max_frame_num: u32 = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
-        // §8.2.5.2 is a no-op when the previous reference picture is
-        // the immediate predecessor (or when no reference has yet been
-        // seen — we let the first non-IDR reference picture seed
-        // `prev_ref_frame_num`).
-        let Some(prev) = self.prev_ref_frame_num else {
-            return Ok(());
-        };
-        let mut expected = (prev + 1) % max_frame_num;
-        if expected == current_frame_num {
-            return Ok(());
-        }
-
-        // Guard against a runaway loop from a bogus `current_frame_num`;
-        // the spec allows up to MaxFrameNum iterations.
-        //
-        // Round 430 (2026-07-25 scheduled-fuzz OOM triage): the loop
-        // used to allocate a full placeholder picture for EVERY missing
-        // frame_num — up to MaxFrameNum (2^16) sample buffers per gap,
-        // even though the §8.2.5.3 sliding window immediately evicts
-        // all but the newest `max_num_ref_frames` of them. Now the loop
-        // only maintains the metadata state (DPB entries, POC
-        // stepping); sample buffers are materialised afterwards for the
-        // few gap entries that actually survived the window.
-        let first_gap_key = self.next_dpb_key;
-        let mut iterations: u32 = 0;
-        while expected != current_frame_num && iterations < max_frame_num {
-            // §8.2.1.3 POC type 2 (and also §8.2.1.2 type 1) treat each
-            // non-existing frame as a reference picture with its own
-            // `frame_num`, so step the POC state's `prev_frame_num` and
-            // `prev_frame_num_offset` exactly as a real reference would.
-            if matches!(sps.pic_order_cnt_type, 1 | 2) {
-                let prev_fnum_offset = self.poc_state.prev_frame_num_offset;
-                let new_offset = if self.poc_state.prev_frame_num > expected {
-                    prev_fnum_offset + max_frame_num as i64
-                } else {
-                    prev_fnum_offset
-                };
-                self.poc_state.prev_frame_num_offset = new_offset;
+    /// * a gap longer than `max_num_ref_frames` is shortened to the frames
+    ///   the sliding window would keep;
+    /// * each missing frame_num becomes a short-term reference frame, by
+    ///   the sliding window: a copy of the newest short-term reference
+    ///   (its POC + 2; FFmpeg's error concealment), or with none, a gray
+    ///   frame (POC [`GRAY_GAP_POC`]), gray-flagged only while nothing has
+    ///   recovered;
+    /// * none is made while a first field waits for its pair;
+    /// * when the SPS does not allow gaps, the gap frames are
+    ///   `invalid_gap` ([`Self::prune_invalid_gaps`]) and reset the POC
+    ///   history of the output-order estimate.
+    ///
+    /// A stream entered at a non-IDR picture opens with such a gap
+    /// (`ff_prev_frame_num` is −1), and FFmpeg's unmarked random access
+    /// point heuristic counts its frames.
+    fn conceal_frame_num_gap(&mut self, sps: &Sps, frame_num: u32) {
+        let max = 1i32 << (sps.log2_max_frame_num_minus4 + 4);
+        let frame_num = frame_num as i32;
+        let ref_frame_count = sps.max_num_ref_frames as i32;
+        let mut prev = self.ff_prev_frame_num;
+        if frame_num != prev {
+            let mut unwrapped = prev;
+            if unwrapped > frame_num {
+                unwrapped -= max;
             }
-            self.poc_state.prev_frame_num = expected;
-
-            // Derive a POC for the non-existing frame so RefPicList
-            // construction for B slices (unused here but kept correct
-            // in general) has a consistent ordering key.
-            let (top_foc, bot_foc, poc_value) = non_existing_poc(sps, &self.poc_state, expected);
-
-            // §8.2.5.2 — apply the sliding window before adding, so the
-            // DPB never exceeds `max_num_ref_frames` short+long refs.
+            if frame_num - unwrapped > ref_frame_count {
+                unwrapped = frame_num - ref_frame_count - 1;
+                if unwrapped < 0 {
+                    unwrapped += max;
+                }
+                prev = unwrapped;
+            }
+        }
+        let gaps_allowed = sps.gaps_in_frame_num_value_allowed_flag;
+        let first_field_waiting = self.pending_field.is_some();
+        while frame_num != prev && !first_field_waiting && frame_num != (prev + 1) % max {
+            // FFmpeg's `short_ref[0]` before this gap frame joins.
+            let newest = self.newest_short_term_frame(sps);
+            if !gaps_allowed {
+                self.recovery.reset_poc_history();
+            }
+            prev = (prev + 1) % max;
+            let gap_frame_num = prev as u32;
             ref_list::sliding_window_marking(
                 &mut self.dpb_entries,
                 sps.max_num_ref_frames,
-                expected,
-                max_frame_num,
+                gap_frame_num,
+                max as u32,
                 None,
             );
-            // §8.2.5.4 field forms can leave one field of an entry
-            // referenced while the frame-level marking dropped — keep
-            // the entry while ANY field is still a reference.
             self.dpb_entries.retain(|e| e.is_any_field_ref());
-
+            let (mut pic, poc) = match newest {
+                Some((pic, poc)) => (pic, poc.saturating_add(2)),
+                None => {
+                    let mut pic = gray_picture(
+                        sps.pic_width_in_mbs() * 16,
+                        sps.frame_height_in_mbs() * 16,
+                        sps.chroma_array_type(),
+                        sps.bit_depth_luma_minus8 + 8,
+                        sps.bit_depth_chroma_minus8 + 8,
+                    );
+                    pic.gray = !self.recovery.any_recovered();
+                    (pic, GRAY_GAP_POC)
+                }
+            };
+            pic.frame_num = gap_frame_num;
+            pic.pic_order_cnt = poc;
             let key = self.mint_dpb_key();
             let mut entry = DpbEntry {
-                frame_num: expected,
-                top_field_order_cnt: top_foc,
-                bottom_field_order_cnt: bot_foc,
-                pic_order_cnt: poc_value,
+                frame_num: gap_frame_num,
+                top_field_order_cnt: poc,
+                bottom_field_order_cnt: poc,
+                pic_order_cnt: poc,
                 structure: PicStructure::Frame,
                 marking: RefMarking::ShortTerm,
                 long_term_frame_idx: 0,
@@ -2461,72 +2615,82 @@ impl H264CodecDecoder {
             };
             entry.sync_field_markings();
             self.dpb_entries.push(entry);
-
-            self.prev_ref_frame_num = Some(expected);
-            expected = (expected + 1) % max_frame_num;
-            iterations += 1;
-        }
-
-        if iterations > 0 {
-            // §8.2.5.2 — a neutral placeholder picture for each gap
-            // entry that survived the sliding window. Samples are
-            // mid-grey (2^(bit_depth-1)) because the spec only
-            // guarantees "not available for prediction"; mid-grey keeps
-            // any accidental reference from producing wildly
-            // out-of-range residuals. Only the surviving entries (at
-            // most `max_num_ref_frames`) get sample buffers — the
-            // evicted majority were never observable by later slices.
-            let gray = gray_picture(
-                sps.pic_width_in_mbs() * 16,
-                sps.frame_height_in_mbs() * 16,
-                sps.chroma_array_type(),
-                sps.bit_depth_luma_minus8 + 8,
-                sps.bit_depth_chroma_minus8 + 8,
-            );
-            let gap_keys = first_gap_key..self.next_dpb_key;
-            for entry in &self.dpb_entries {
-                if gap_keys.contains(&entry.dpb_key) {
-                    self.ref_store.insert(entry.dpb_key, gray.clone());
-                }
+            self.ref_store.insert(key, pic);
+            if !gaps_allowed {
+                self.invalid_gap_keys.insert(key);
             }
-            // Real reference pictures evicted by the gap's sliding
-            // window are dead now — release their samples too.
+            self.prune_invalid_gaps(gap_frame_num, sps);
             self.prune_ref_store();
         }
+        // FFmpeg keeps one `prev_frame_num`, which POC types 1 and 2 read.
+        if prev >= 0 && prev != self.ff_prev_frame_num {
+            self.poc_state.prev_frame_num = prev as u32;
+        }
+    }
 
-        Ok(())
+    /// FFmpeg's `short_ref[0]` as a whole frame: the newest short-term
+    /// reference (a frame, or a field pair interleaved) and its POC, when
+    /// its size and sample format are the current SPS's.
+    fn newest_short_term_frame(&self, sps: &Sps) -> Option<(Picture, i32)> {
+        let entry = self
+            .dpb_entries
+            .iter()
+            .rev()
+            .find(|e| e.any_field_is(RefMarking::ShortTerm))?;
+        let (pic, poc) = if entry.structure.is_field() {
+            let partner = self.dpb_entries.iter().find(|d| {
+                d.structure.is_field()
+                    && d.frame_num == entry.frame_num
+                    && d.structure.is_bottom() != entry.structure.is_bottom()
+            })?;
+            let (top, bottom) = if entry.structure.is_bottom() {
+                (partner, entry)
+            } else {
+                (entry, partner)
+            };
+            let (top_pic, bottom_pic) = (
+                self.ref_store.get_by_key(top.dpb_key)?,
+                self.ref_store.get_by_key(bottom.dpb_key)?,
+            );
+            let mut pic = interleave_fields(top_pic, bottom_pic);
+            pic.gray = top_pic.gray || bottom_pic.gray;
+            (pic, top.pic_order_cnt.min(bottom.pic_order_cnt))
+        } else {
+            (
+                self.ref_store.get_by_key(entry.dpb_key)?.clone(),
+                entry.pic_order_cnt,
+            )
+        };
+        let same_format = pic.width_in_samples == sps.pic_width_in_mbs() * 16
+            && pic.height_in_samples == sps.frame_height_in_mbs() * 16
+            && pic.chroma_array_type == sps.chroma_array_type()
+            && pic.bit_depth_luma == sps.bit_depth_luma_minus8 + 8
+            && pic.bit_depth_chroma == sps.bit_depth_chroma_minus8 + 8;
+        same_format.then_some((pic, poc))
+    }
+
+    /// h264_refs.c 795-801: after each marking, a gap frame FFmpeg marked
+    /// `invalid_gap` stops being a reference once its frame_num is more
+    /// than `max_num_ref_frames` behind the marked picture's.
+    fn prune_invalid_gaps(&mut self, current_frame_num: u32, sps: &Sps) {
+        let mask = (1u32 << (sps.log2_max_frame_num_minus4 + 4)) - 1;
+        let keys = &self.invalid_gap_keys;
+        self.dpb_entries.retain(|e| {
+            !(keys.contains(&e.dpb_key)
+                && e.any_field_is(RefMarking::ShortTerm)
+                && (current_frame_num.wrapping_sub(e.frame_num) & mask) > sps.max_num_ref_frames)
+        });
     }
 }
 
-/// §8.2.1 — compute `(TopFieldOrderCnt, BottomFieldOrderCnt, PicOrderCnt)`
-/// for a synthetic non-existing reference frame. Only type 2 and type 1
-/// need real values; type 0 is left at (0, 0, 0) since non-existing
-/// frames with type 0 are never used to predict other pictures' POCs.
-fn non_existing_poc(sps: &Sps, state: &PocState, frame_num: u32) -> (i32, i32, i32) {
-    match sps.pic_order_cnt_type {
-        2 => {
-            // §8.2.1.3 treats a reference picture as
-            // `2 * (FrameNumOffset + frame_num)`. We use the already-
-            // updated `prev_frame_num_offset` because the caller has
-            // stepped it for this non-existing frame.
-            let poc = 2 * (state.prev_frame_num_offset + frame_num as i64);
-            let poc = poc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            (poc, poc, poc)
-        }
-        1 => {
-            // A conservative stand-in — type-1 streams rarely hit the
-            // gap path and we do not need pixel-exact reproduction of
-            // the expectedPicOrderCnt arithmetic here.
-            (0, 0, 0)
-        }
-        _ => (0, 0, 0),
-    }
-}
+/// The POC of a gray gap frame. FFmpeg leaves it 0 while its own POCs
+/// count from 65536 after an IDR picture or a flush, so it sorts before
+/// every decoded picture; here POCs count from 0, so a value far below
+/// them keeps that order.
+const GRAY_GAP_POC: i32 = i32::MIN / 2;
 
-/// §8.2.5.2 — mid-grey placeholder picture for a synthetic non-existing
-/// reference frame. Samples are set to `2^(bit_depth - 1)` per plane so
-/// that accidental motion-compensation references produce neutral
-/// output instead of zeroes (which would bias the residual).
+/// A gap frame with no reference to copy: every sample `2^(bit_depth - 1)`,
+/// FFmpeg's `color_frame` (h264_slice.c).
 fn gray_picture(
     width_samples: u32,
     height_samples: u32,
@@ -2541,7 +2705,6 @@ fn gray_picture(
         bit_depth_y,
         bit_depth_c,
     );
-    p.non_existing = true;
     let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
     let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
     for v in p.luma.iter_mut() {
@@ -3025,7 +3188,10 @@ impl Decoder for H264CodecDecoder {
         self.next_dpb_key = 0;
         self.prev_had_mmco5 = false;
         self.prev_reference_top_foc = 0;
-        self.prev_ref_frame_num = None;
+        // ff_h264_flush_change / h264_decode_flush.
+        self.ff_prev_frame_num = -1;
+        self.non_gray = false;
+        self.invalid_gap_keys.clear();
         // Drop any picture currently being assembled — reset implies we
         // discard in-flight state, not deliver it.
         self.in_progress = None;
@@ -3361,6 +3527,7 @@ mod tests {
             height: 1,
             format: Some(PixelFormat::Gray8),
             recovered: crate::recovery::RECOVERED_IDR,
+            id: None,
         }
     }
 
@@ -4017,6 +4184,8 @@ mod tests {
             recovered: 0,
             frame_intra: false,
             frame_b: false,
+            gray: false,
+            output_id: None,
         });
     }
 
@@ -4470,6 +4639,8 @@ mod tests {
             recovered: crate::recovery::RECOVERED_IDR,
             frame_intra: true,
             frame_b: false,
+            idr: false,
+            output_id: None,
         }
     }
 
@@ -4514,13 +4685,27 @@ mod tests {
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
-        dec.handle_field_output(field(top, false, 3, 8, Some(99), FrameCropMargins::default()));
+        dec.handle_field_output(field(
+            top,
+            false,
+            3,
+            8,
+            Some(99),
+            FrameCropMargins::default(),
+        ));
         // The first field alone produces no output (held pending).
         assert!(dec.ready.is_empty());
         assert!(dec.pending_field.is_some());
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
-        dec.handle_field_output(field(bottom, true, 3, 10, None, FrameCropMargins::default()));
+        dec.handle_field_output(field(
+            bottom,
+            true,
+            3,
+            10,
+            None,
+            FrameCropMargins::default(),
+        ));
         // Pair completed → pending cleared, one frame queued (possibly
         // still inside the output DPB until bumped). Force a drain.
         assert!(dec.pending_field.is_none());
@@ -4647,15 +4832,39 @@ mod tests {
             bottom: 4,
         };
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.handle_field_output(field(field_pic(16, 4, 30, 128, 8, 3), false, 3, 8, None, crop));
-        dec.handle_field_output(field(field_pic(16, 4, 40, 128, 10, 3), true, 3, 10, None, crop));
+        dec.handle_field_output(field(
+            field_pic(16, 4, 30, 128, 8, 3),
+            false,
+            3,
+            8,
+            None,
+            crop,
+        ));
+        dec.handle_field_output(field(
+            field_pic(16, 4, 40, 128, 10, 3),
+            true,
+            3,
+            10,
+            None,
+            crop,
+        ));
         // An orphan top field (next frame_num), flushed at EOF.
-        dec.handle_field_output(field(field_pic(16, 4, 50, 128, 12, 4), false, 4, 12, None, crop));
+        dec.handle_field_output(field(
+            field_pic(16, 4, 50, 128, 12, 4),
+            false,
+            4,
+            12,
+            None,
+            crop,
+        ));
         dec.flush_pending_field();
         dec.eof = true;
         let mut sizes = Vec::new();
         while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            let size = (vf.planes[0].stride, vf.planes[0].data.len() / vf.planes[0].stride);
+            let size = (
+                vf.planes[0].stride,
+                vf.planes[0].data.len() / vf.planes[0].stride,
+            );
             // The decoder reports the visible size of the frame it just
             // returned.
             assert_eq!(
@@ -4671,14 +4880,13 @@ mod tests {
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
     /// frame_num gap fill must stay memory-bounded. A hostile stream
-    /// can declare `gaps_in_frame_num_value_allowed_flag = 1` with
-    /// MaxFrameNum = 2^16 and jump `frame_num` by tens of thousands;
-    /// the gap loop used to allocate a full placeholder picture per
-    /// missing frame_num (and the store never released ANY picture),
-    /// which is an unbounded allocation driven by a few input bytes.
-    /// Post-fix: only the gap entries that survive the §8.2.5.3
-    /// sliding window carry sample buffers, and the store holds
-    /// exactly the DPB's pictures.
+    /// can declare MaxFrameNum = 2^16 and jump `frame_num` by tens of
+    /// thousands; a gap loop allocating a picture per missing frame_num
+    /// is an unbounded allocation driven by a few input bytes. FFmpeg
+    /// shortens the gap to the `max_num_ref_frames` frames the sliding
+    /// window keeps, and the store holds exactly the DPB's pictures. With
+    /// nothing to copy, the first gap frame is gray and the next ones copy
+    /// it, two POCs on each.
     #[test]
     fn frame_num_gap_fill_is_memory_bounded() {
         use crate::sps::Sps;
@@ -4716,31 +4924,59 @@ mod tests {
         };
 
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
-        dec.prev_ref_frame_num = Some(0);
-        dec.fill_frame_num_gap(&sps, 40_000)
-            .expect("gap fill must succeed");
+        dec.ff_prev_frame_num = 0;
+        dec.conceal_frame_num_gap(&sps, 40_000);
 
-        // §8.2.5.3 sliding window: only the newest
-        // `max_num_ref_frames` synthetic references survive.
+        // Only the newest `max_num_ref_frames` gap frames are made.
         assert_eq!(dec.dpb_entries.len(), 3);
         let frame_nums: Vec<u32> = dec.dpb_entries.iter().map(|e| e.frame_num).collect();
         assert_eq!(frame_nums, vec![39_997, 39_998, 39_999]);
+        let pocs: Vec<i32> = dec.dpb_entries.iter().map(|e| e.pic_order_cnt).collect();
+        assert_eq!(pocs, vec![GRAY_GAP_POC, GRAY_GAP_POC + 2, GRAY_GAP_POC + 4]);
 
-        // The store holds sample buffers for exactly the surviving
-        // entries — not one per skipped frame_num.
+        // The store holds sample buffers for exactly those entries.
         assert_eq!(dec.ref_picture_count(), 3);
         for e in &dec.dpb_entries {
             let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
-            assert!(pic.non_existing, "gap placeholders are non-existing");
+            assert!(pic.gray, "nothing has recovered: the gap frames are gray");
+            assert!(pic.luma.iter().all(|&v| v == 128));
         }
 
-        // §8.2.5.2 stepped the POC state across every gap frame.
+        // FFmpeg's single `prev_frame_num` also feeds POC types 1 and 2.
         assert_eq!(dec.poc_state.prev_frame_num, 39_999);
-        assert_eq!(dec.prev_ref_frame_num, Some(39_999));
 
-        // A second, small gap right after must keep the bound.
-        dec.fill_frame_num_gap(&sps, 40_010).expect("second gap");
+        // A second gap right after keeps the bound.
+        dec.ff_prev_frame_num = 40_000;
+        dec.conceal_frame_num_gap(&sps, 40_010);
+
         assert_eq!(dec.dpb_entries.len(), 3);
         assert_eq!(dec.ref_picture_count(), 3);
+    }
+
+    /// x264's avcC for `bframes=2` (High, VUI `max_num_reorder_frames` 2):
+    /// FFmpeg's find_stream_info reports `has_b_frames` 2 for it. The
+    /// demuxer's own value wins; without a VUI reorder depth nothing tells.
+    #[test]
+    fn video_delay_is_ffmpegs_probed_reorder_depth() {
+        const AVCC: [u8; 46] = [
+            0x01, 0x64, 0x00, 0x0d, 0xff, 0xe1, 0x00, 0x19, 0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9,
+            0x41, 0x41, 0xfb, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03,
+            0x20, 0xf1, 0x42, 0x99, 0x60, 0x01, 0x00, 0x06, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0,
+            0xfd, 0xf8, 0xf8, 0x00,
+        ];
+        let mut params = CodecParameters::video(CodecId::new("h264"));
+        params.extradata = AVCC.to_vec();
+        assert_eq!(super::video_delay(&params), Some(2));
+        // The same SPS as Annex B extradata.
+        let mut annex_b = vec![0, 0, 0, 1];
+        annex_b.extend_from_slice(&AVCC[8..33]);
+        params.extradata = annex_b;
+        assert_eq!(super::video_delay(&params), Some(2));
+        params.options.insert("video_delay", "1");
+        assert_eq!(super::video_delay(&params), Some(1));
+        assert_eq!(
+            super::video_delay(&CodecParameters::video(CodecId::new("h264"))),
+            None
+        );
     }
 }
