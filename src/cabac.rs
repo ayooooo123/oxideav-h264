@@ -72,11 +72,13 @@ use crate::bitstream::{BitError, BitReader};
 /// decoding is on the hot path (millions of calls per frame), and a
 /// `getenv()` syscall per bin is the difference between sub-realtime
 /// and sub-second-per-frame decoding on a 720p clip.
-#[inline]
+use std::sync::LazyLock;
+static BIN_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some());
+
+#[inline(always)]
 fn bin_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some())
+    *BIN_TRACE
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -366,66 +368,91 @@ impl<'a> CabacDecoder<'a> {
     ///       binVal      = valMPS
     ///       pStateIdx   = transIdxMPS[pStateIdx]
     ///   RenormD()
+    #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
-        // Debug: capture pre-state before we mutate anything. `ctx` does
-        // not carry a ctxIdx (we only see the `(state, mps)` pair), so the
-        // caller is responsible for any richer trace line. We still emit a
-        // minimal per-bin trace gated on OXIDEAV_H264_BIN_TRACE that
-        // covers every decision bin with the engine-visible state.
-        let trace_on = bin_trace_enabled();
-        let pre_state = ctx.state_idx;
-        let pre_mps = ctx.val_mps;
-        let pre_range = self.cod_i_range;
-        let pre_offset = self.cod_i_offset;
+        if bin_trace_enabled() {
+            return self.decode_decision_traced(ctx);
+        }
 
-        // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
         let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
         self.cod_i_range -= cod_i_range_lps;
 
         let bin_val: u8;
         if self.cod_i_offset >= self.cod_i_range {
-            // LPS path.
             bin_val = 1 - ctx.val_mps;
             self.cod_i_offset -= self.cod_i_range;
             self.cod_i_range = cod_i_range_lps;
-            // §9.3.3.2.1.1 equation (9-27).
             if ctx.state_idx == 0 {
                 ctx.val_mps = 1 - ctx.val_mps;
             }
             ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
         } else {
-            // MPS path.
             bin_val = ctx.val_mps;
             ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
         }
 
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
-        if trace_on {
-            eprintln!(
-                "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre_state, pre_mps, pre_range, pre_offset,
-                bin_val,
-                ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_offset,
-            );
-        }
         Ok(bin_val)
     }
 
-    /// §9.3.3.2.3 — DecodeBypass. Reads one bypass bin (no context,
-    /// no state update, no renorm of the state machine).
-    ///
-    /// Algorithm (Figure 9-5):
-    ///   codIOffset = (codIOffset << 1) | read_bits(1)
-    ///   if codIOffset >= codIRange:
-    ///       binVal     = 1
-    ///       codIOffset -= codIRange
-    ///   else:
-    ///       binVal = 0
+    #[cold]
+    fn decode_decision_traced(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
+        let pre_state = ctx.state_idx;
+        let pre_mps = ctx.val_mps;
+        let pre_range = self.cod_i_range;
+        let pre_offset = self.cod_i_offset;
+
+        let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
+        let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+        self.cod_i_range -= cod_i_range_lps;
+
+        let bin_val: u8;
+        if self.cod_i_offset >= self.cod_i_range {
+            bin_val = 1 - ctx.val_mps;
+            self.cod_i_offset -= self.cod_i_range;
+            self.cod_i_range = cod_i_range_lps;
+            if ctx.state_idx == 0 {
+                ctx.val_mps = 1 - ctx.val_mps;
+            }
+            ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
+        } else {
+            bin_val = ctx.val_mps;
+            ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
+        }
+
+        self.renorm_d()?;
+        self.bin_count = self.bin_count.wrapping_add(1);
+        eprintln!(
+            "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
+            self.bin_count,
+            pre_state, pre_mps, pre_range, pre_offset,
+            bin_val,
+            ctx.state_idx, ctx.val_mps, self.cod_i_range, self.cod_i_offset,
+        );
+        Ok(bin_val)
+    }
+
+    /// §9.3.3.2.3 — DecodeBypass.
+    #[inline(always)]
     pub fn decode_bypass(&mut self) -> CabacResult<u8> {
-        let trace_on = bin_trace_enabled();
+        if bin_trace_enabled() {
+            return self.decode_bypass_traced();
+        }
+        self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
+        let bin = if self.cod_i_offset >= self.cod_i_range {
+            self.cod_i_offset -= self.cod_i_range;
+            1
+        } else {
+            0
+        };
+        self.bin_count = self.bin_count.wrapping_add(1);
+        Ok(bin)
+    }
+
+    #[cold]
+    fn decode_bypass_traced(&mut self) -> CabacResult<u8> {
         let pre_range = self.cod_i_range;
         let pre_offset = self.cod_i_offset;
         self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
@@ -436,67 +463,62 @@ impl<'a> CabacDecoder<'a> {
             0
         };
         self.bin_count = self.bin_count.wrapping_add(1);
-        if trace_on {
-            eprintln!(
-                "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre_range, pre_offset,
-                bin,
-                self.cod_i_range, self.cod_i_offset,
-            );
-        }
+        eprintln!(
+            "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+            self.bin_count,
+            pre_range, pre_offset,
+            bin,
+            self.cod_i_range, self.cod_i_offset,
+        );
         Ok(bin)
     }
 
-    /// §9.3.3.2.4 — DecodeTerminate. Special path for `end_of_slice_flag`
-    /// and the I_PCM terminator bin (ctxIdx = 276).
-    ///
-    /// Algorithm (Figure 9-6):
-    ///   codIRange -= 2
-    ///   if codIOffset >= codIRange:
-    ///       binVal = 1  (decoding terminated, no renorm)
-    ///   else:
-    ///       binVal = 0
-    ///       RenormD()
+    /// §9.3.3.2.4 — DecodeTerminate.
+    #[inline(always)]
     pub fn decode_terminate(&mut self) -> CabacResult<u8> {
-        let trace_on = bin_trace_enabled();
-        let pre_range = self.cod_i_range;
-        let pre_offset = self.cod_i_offset;
+        if bin_trace_enabled() {
+            return self.decode_terminate_traced();
+        }
         self.cod_i_range -= 2;
         let bin = if self.cod_i_offset >= self.cod_i_range {
-            // Terminated. Per spec: "no renormalization is carried out, and
-            // CABAC decoding is terminated". The last inserted bit is the
-            // rbsp_stop_one_bit when decoding end_of_slice_flag.
             1
         } else {
             self.renorm_d()?;
             0
         };
         self.bin_count = self.bin_count.wrapping_add(1);
-        if trace_on {
-            eprintln!(
-                "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count,
-                pre_range, pre_offset,
-                bin,
-                self.cod_i_range, self.cod_i_offset,
-            );
-        }
         Ok(bin)
     }
 
-    /// §9.3.3.2.2 — RenormD. Called after DecodeDecision whenever
-    /// `codIRange < 256`, and from DecodeTerminate on the "not yet"
-    /// branch.
-    ///
-    /// Algorithm (Figure 9-4):
-    ///   while codIRange < 256:
-    ///       codIRange  <<= 1
-    ///       codIOffset  = (codIOffset << 1) | read_bits(1)
+    #[cold]
+    fn decode_terminate_traced(&mut self) -> CabacResult<u8> {
+        let pre_range = self.cod_i_range;
+        let pre_offset = self.cod_i_offset;
+        self.cod_i_range -= 2;
+        let bin = if self.cod_i_offset >= self.cod_i_range {
+            1
+        } else {
+            self.renorm_d()?;
+            0
+        };
+        self.bin_count = self.bin_count.wrapping_add(1);
+        eprintln!(
+            "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+            self.bin_count,
+            pre_range, pre_offset,
+            bin,
+            self.cod_i_range, self.cod_i_offset,
+        );
+        Ok(bin)
+    }
+
+    /// §9.3.3.2.2 — RenormD.
+    #[inline(always)]
     fn renorm_d(&mut self) -> CabacResult<()> {
-        while self.cod_i_range < 256 {
-            self.cod_i_range <<= 1;
-            self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
+        if self.cod_i_range < 256 {
+            let shift = (self.cod_i_range as u32).leading_zeros() - 23;
+            self.cod_i_range <<= shift;
+            self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.u(shift)?;
         }
         Ok(())
     }

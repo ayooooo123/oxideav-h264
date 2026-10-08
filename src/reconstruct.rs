@@ -868,35 +868,38 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
 /// Cached `OXIDEAV_H264_NO_DEBLOCK` env var lookup. Reading the env var
 /// per slice would dominate the decode wall-time on real content, since
 /// the OS resolves env vars through a `getenv()` syscall.
+use std::sync::LazyLock;
+
+static DEBLOCK_NO_OP: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok());
+static RECON_DEBUG: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok());
+static RECON_DEBUG_MB: LazyLock<Option<u32>> = LazyLock::new(|| {
+    std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+});
+static DEBLOCK_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some());
+
+#[inline(always)]
 fn deblock_no_op_cached() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok())
+    *DEBLOCK_NO_OP
 }
 
-/// Cached `OXIDEAV_H264_RECON_DEBUG` flag (per-MB reconstruct trace).
+#[inline(always)]
 fn recon_debug_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
+    *RECON_DEBUG
 }
 
-/// Cached `OXIDEAV_H264_RECON_DEBUG_MB` (specific MB-address trace).
+#[inline(always)]
 fn recon_debug_mb_target() -> Option<u32> {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-    })
+    *RECON_DEBUG_MB
 }
 
-/// Cached `OXIDEAV_H264_DEBLOCK_TRACE` flag.
+#[inline(always)]
 fn deblock_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some())
+    *DEBLOCK_TRACE
 }
 
 /// §8.5.8 eq. 8-309 (T-REC-H.264-202408) — derive the current MB's QP_Y
@@ -10835,6 +10838,13 @@ fn plane_set(pic: &mut Picture, plane: u8, x: i32, y: i32, v: i32) {
         pic.set_cr(x, y, v);
     }
 }
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Fixed-length kernels and NEON loopfilter adapted from FFmpeg 2da55bf
+// libavcodec/h264_loopfilter.c and libavcodec/aarch64/h264dsp_neon.S.
+// Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at>
+// Copyright (c) 2008 Mans Rullgard <mans@mansr.com>
+// Copyright (c) 2013-2014 Janne Grunau <janne-libav@jannau.net>
+// See LICENSE-LGPL.
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 

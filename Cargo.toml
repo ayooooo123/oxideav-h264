@@ -3,8 +3,9 @@ name = "oxideav-h264"
 version = "0.1.8"
 edition = "2021"
 rust-version = "1.80"
-# src/recovery.rs ports FFmpeg (LGPL-2.1-or-later, see LICENSE-LGPL); the
-# rest of the crate is MIT.
+# src/recovery.rs and the loopfilter/NEON kernels in src/reconstruct.rs
+# port FFmpeg 2da55bf (LGPL-2.1-or-later, see LICENSE-LGPL); the rest of
+# the crate is MIT.
 license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-h264"
 homepage = "https://github.com/OxideAV/oxideav-h264"

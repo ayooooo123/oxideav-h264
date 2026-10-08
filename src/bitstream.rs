@@ -85,12 +85,39 @@ impl<'a> BitReader<'a> {
     }
 
     /// §7.2 `u(n)`. `n` must be ≤ 32.
+    #[inline(always)]
     pub fn u(&mut self, bits: u32) -> BitResult<u32> {
         if bits > 32 {
             return Err(BitError::TooManyBits(bits));
         }
+        if bits == 0 {
+            return Ok(0);
+        }
         if self.bits_remaining() < bits as usize {
             return Err(BitError::Eof);
+        }
+        if bits == 1 {
+            let bit = ((self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1) as u32;
+            self.bit_pos += 1;
+            if self.bit_pos == 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+            return Ok(bit);
+        }
+        let total_bits = self.bit_pos as usize + bits as usize;
+        if total_bits <= 32 && self.byte_pos + 4 <= self.data.len() {
+            let bytes = [
+                self.data[self.byte_pos],
+                self.data[self.byte_pos + 1],
+                self.data[self.byte_pos + 2],
+                self.data[self.byte_pos + 3],
+            ];
+            let raw = u32::from_be_bytes(bytes);
+            let val = (raw << self.bit_pos) >> (32 - bits);
+            self.byte_pos += total_bits / 8;
+            self.bit_pos = (total_bits % 8) as u8;
+            return Ok(val);
         }
         let mut value: u32 = 0;
         for _ in 0..bits {

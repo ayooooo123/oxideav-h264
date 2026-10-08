@@ -64,29 +64,31 @@ use crate::sps::Sps;
 // We resolve each env var **once** on first access via `OnceLock` and
 // thereafter return the cached boolean / parsed value.
 
-#[inline]
+use std::sync::LazyLock;
+
+static DBG_GENERAL: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("OXIDEAV_H264_DEBUG").is_ok());
+static DBG_MBTYPE_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some());
+static DBG_MB_TRACE: LazyLock<Option<u32>> = LazyLock::new(|| {
+    std::env::var("OXIDEAV_H264_MB_TRACE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+});
+
+#[inline(always)]
 fn dbg_general_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_DEBUG").is_ok())
+    *DBG_GENERAL
 }
 
-#[inline]
+#[inline(always)]
 fn dbg_mbtype_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some())
+    *DBG_MBTYPE_TRACE
 }
 
-#[inline]
+#[inline(always)]
 fn dbg_mb_trace_target() -> Option<u32> {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OXIDEAV_H264_MB_TRACE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-    })
+    *DBG_MB_TRACE
 }
 
 // ---------------------------------------------------------------------------
