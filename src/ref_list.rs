@@ -958,6 +958,11 @@ pub fn modify_ref_pic_list(
 /// The spec temporarily extends the list length by 1 during the
 /// procedure and truncates back to `num_active` at the end; we emulate
 /// that by working on a temporary vec.
+///
+/// A modification naming a picture the DPB does not hold (`target_key`
+/// is the sentinel) only clears entry `ref_idx_lx`, nothing shifts: FFmpeg
+/// 2da55bf `ff_h264_build_ref_list` ("reference picture missing during
+/// reorder"), whose default reference then fills the entry.
 fn splice_into_list<F>(
     list: &mut Vec<u32>,
     ref_idx_lx: usize,
@@ -968,6 +973,10 @@ fn splice_into_list<F>(
     F: Fn(u32) -> bool,
 {
     if ref_idx_lx >= num_active {
+        return;
+    }
+    if target_key == u32::MAX {
+        list[ref_idx_lx] = u32::MAX;
         return;
     }
     // Temporary "one element longer" vec per the spec's pseudo-code.
@@ -1152,6 +1161,11 @@ fn splice_field_into_list(
     target: RefFieldEntry,
 ) {
     if ref_idx_lx >= num_active {
+        return;
+    }
+    // A missing picture only clears the entry (see `splice_into_list`).
+    if target.dpb_key == u32::MAX {
+        list[ref_idx_lx] = target;
         return;
     }
     let mut tmp: Vec<RefFieldEntry> = Vec::with_capacity(num_active + 1);

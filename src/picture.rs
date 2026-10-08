@@ -43,13 +43,12 @@ pub struct Picture {
     pub luma: Vec<i32>,
     pub cb: Vec<i32>,
     pub cr: Vec<i32>,
-    /// §8.2.5.2 — set on the placeholder pictures synthesised to fill a
-    /// gap in `frame_num`. Their samples are "not available for
-    /// prediction of other pictures": a conforming bitstream never
-    /// samples a non-existing frame, so motion compensation refuses to
-    /// (reconstructing from invented placeholder samples would silently
-    /// fabricate picture content).
-    pub non_existing: bool,
+    /// FFmpeg's `H264Picture.gray` (2da55bf): the samples are the gray
+    /// fill of a frame_num gap frame made before anything recovered, or
+    /// were predicted from such a frame. A reference list entry that is
+    /// gray is replaced by a non-gray default reference once an I slice
+    /// has been decoded (`noref_gray`, h264_refs.c).
+    pub gray: bool,
     /// Set by caller after reconstruction.
     pub pic_order_cnt: i32,
     pub frame_num: u32,
@@ -158,7 +157,7 @@ impl Picture {
             luma: vec![0; luma_len],
             cb: vec![0; chroma_len],
             cr: vec![0; chroma_len],
-            non_existing: false,
+            gray: false,
             pic_order_cnt: 0,
             frame_num: 0,
             mb_width_in_picture: 0,
@@ -224,7 +223,7 @@ impl Picture {
             out.cb = take_rows(&self.cb, cw, ch);
             out.cr = take_rows(&self.cr, cw, ch);
         }
-        out.non_existing = self.non_existing;
+        out.gray = self.gray;
         out.frame_num = self.frame_num;
         out.pic_order_cnt = self.pic_order_cnt;
         // §8.4.1.2.1 — carry the FRAME's colocated-motion state so the

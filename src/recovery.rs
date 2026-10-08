@@ -26,13 +26,14 @@
 //!
 //! The decoder drives this state at the points FFmpeg does: per packet,
 //! per SEI, per IDR slice, at each picture's first slice, after a
-//! reference picture's marking, and at each picture's turn in output
-//! order. FFmpeg updates `frame_recovered` when *its* decoder outputs a
-//! picture; this decoder outputs in the same order, but its §C.4 output
-//! window can be longer, so a picture decoded between FFmpeg's output of
-//! a heuristic random access point and this decoder's can be judged
-//! differently when the stream has B pictures. IDR and recovery point
-//! decisions do not depend on that timing.
+//! reference picture's marking, and when FFmpeg takes a frame from its
+//! `delayed_pic` for output, at a later frame's start. That last step
+//! sets `frame_recovered`, which decides the frames that start after it;
+//! this decoder's §C.4 output can release a frame later than FFmpeg takes
+//! it, so it keeps FFmpeg's `delayed_pic` alongside
+//! ([`Recovery::select_output`]) and shows what FFmpeg decided then.
+
+use std::collections::HashMap;
 
 use crate::ref_list::{DpbEntry, MmcoOp, RefMarking};
 
@@ -138,6 +139,16 @@ pub(crate) struct MarkedPicture {
     pub intra: bool,
 }
 
+/// A frame in FFmpeg's `delayed_pic`: its id, POC, and whether it opens a
+/// new output run (an IDR frame, or `mmco_reset`: after MMCO 5, a flush,
+/// or a rejected POC).
+#[derive(Debug, Clone)]
+struct Delayed {
+    id: u32,
+    poc: i32,
+    boundary: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Recovery {
     /// `h->sei.recovery_point.recovery_frame_cnt` (`None` for -1): the
@@ -157,6 +168,16 @@ pub(crate) struct Recovery {
     has_b_frames: u32,
     /// `h->last_pocs`, ascending; `i32::MIN` where unset.
     last_pocs: [i32; MAX_DPB_FRAMES],
+    /// `h->delayed_pic`, in decoding order.
+    delayed: Vec<Delayed>,
+    /// `h->next_outputed_poc`.
+    next_outputed_poc: i64,
+    /// `h->mmco_reset`: the next frame opens an output run.
+    mmco_reset: bool,
+    /// The live recovery flags of the frames in `delayed`, by id.
+    flags: HashMap<u32, u8>,
+    /// Whether FFmpeg outputs the frames it took from `delayed`, by id.
+    verdicts: HashMap<u32, bool>,
 }
 
 impl Default for Recovery {
@@ -169,6 +190,12 @@ impl Default for Recovery {
             has_recovery_point: false,
             has_b_frames: 0,
             last_pocs: [i32::MIN; MAX_DPB_FRAMES],
+            delayed: Vec::new(),
+            next_outputed_poc: i64::MIN,
+            // h264_decode_init ends with ff_h264_flush_change.
+            mmco_reset: true,
+            flags: HashMap::new(),
+            verdicts: HashMap::new(),
         }
     }
 }
@@ -256,8 +283,14 @@ impl Recovery {
     /// frame (at a field pair's second field): `poc` is the frame's
     /// PicOrderCnt, `b_frame` its first slice is a B slice,
     /// `num_reorder_frames` the SPS's VUI value when it carries a
-    /// bitstream restriction.
-    pub(crate) fn frame_output_order(&mut self, poc: i32, b_frame: bool, num_reorder_frames: Option<u32>) {
+    /// bitstream restriction. True when FFmpeg rejects the POC ("Invalid
+    /// POC"), which makes the frame open an output run.
+    pub(crate) fn frame_output_order(
+        &mut self,
+        poc: i32,
+        b_frame: bool,
+        num_reorder_frames: Option<u32>,
+    ) -> bool {
         if let Some(n) = num_reorder_frames {
             self.has_b_frames = self.has_b_frames.max(n);
         }
@@ -282,9 +315,89 @@ impl Recovery {
         if out_of_order == MAX_DPB_FRAMES {
             self.reset_poc_history();
             self.last_pocs[0] = poc;
+            return true;
         } else if (self.has_b_frames as usize) < out_of_order && num_reorder_frames.is_none() {
             self.has_b_frames = out_of_order as u32;
         }
+        false
+    }
+
+    /// h264_select_output_frame (h264_slice.c:1318-1405) at a frame's
+    /// start (a pair's second field), after [`Self::frame_output_order`]:
+    /// the frame joins `delayed_pic` with its flags so far (`key`: an IDR
+    /// frame; `invalid_poc`: what `frame_output_order` returned). When
+    /// more frames wait than `has_b_frames`, FFmpeg takes the lowest-POC
+    /// one of the first output run out: its flags update
+    /// `frame_recovered` and decide whether it is shown. FFmpeg decides
+    /// here, at a later frame's start; this decoder's §C.4 output can come
+    /// later, so [`Self::shows`] returns the decision taken here.
+    ///
+    /// A frame behind the output order leaves `delayed_pic` undecided.
+    /// FFmpeg drops it ("no picture ooo"), which happens when its reorder
+    /// depth started below the stream's: a decoder nobody gave the
+    /// demuxer's probed depth. fftools always probes, so this decoder
+    /// keeps such a frame and decides at its turn in output order.
+    pub(crate) fn select_output(
+        &mut self,
+        id: u32,
+        poc: i32,
+        key: bool,
+        invalid_poc: bool,
+        recovered: u8,
+    ) {
+        let boundary = key || std::mem::take(&mut self.mmco_reset) || invalid_poc;
+        self.flags.insert(id, recovered);
+        self.delayed.push(Delayed { id, poc, boundary });
+        let pics = self.delayed.len();
+        let mut out_idx = 0;
+        for i in 1..pics {
+            if self.delayed[i].boundary {
+                break;
+            }
+            if self.delayed[i].poc < self.delayed[out_idx].poc {
+                out_idx = i;
+            }
+        }
+        if self.has_b_frames == 0 && self.delayed[0].boundary {
+            self.next_outputed_poc = i64::MIN;
+        }
+        let out_of_order = i64::from(self.delayed[out_idx].poc) < self.next_outputed_poc;
+        if !out_of_order && pics <= self.has_b_frames as usize {
+            return;
+        }
+        if out_of_order {
+            self.delayed.remove(out_idx);
+            return;
+        }
+        let out = self.delayed.remove(out_idx);
+        let flags = self.flags.remove(&out.id).unwrap_or(0);
+        self.next_outputed_poc = if out_idx == 0 && self.delayed.first().is_some_and(|d| d.boundary)
+        {
+            i64::MIN
+        } else {
+            i64::from(out.poc)
+        };
+        self.frame_recovered |= flags;
+        self.verdicts
+            .insert(out.id, flags | (self.frame_recovered & RECOVERED_SEI) != 0);
+    }
+
+    /// More recovery flags of frame `id` (its marking's heuristic, a
+    /// second field's), while it waits in `delayed_pic`.
+    pub(crate) fn add_flags(&mut self, id: u32, flags: u8) {
+        if let Some(f) = self.flags.get_mut(&id) {
+            *f |= flags;
+        }
+    }
+
+    /// MMCO 5 in frame `id`'s marking (h264_refs.c:726-730): the frame
+    /// and the next open output runs, and the POC history is forgotten.
+    pub(crate) fn mmco5(&mut self, id: Option<u32>) {
+        if let Some(d) = self.delayed.iter_mut().find(|d| Some(d.id) == id) {
+            d.boundary = true;
+        }
+        self.mmco_reset = true;
+        self.reset_poc_history();
     }
 
     /// h264_refs.c:729-730 (MMCO 5) and the other places FFmpeg forgets
@@ -315,12 +428,29 @@ impl Recovery {
         0
     }
 
-    /// h264_select_output_frame (h264_slice.c:1389-1401) and
-    /// send_next_delayed_frame (h264dec.c:1057-1058): whether a picture
-    /// with these flags is output at its turn in output order.
-    pub(crate) fn output(&mut self, recovered: u8) -> bool {
-        self.frame_recovered |= recovered;
-        recovered | (self.frame_recovered & RECOVERED_SEI) != 0
+    /// Whether a frame with these flags is output at its turn in this
+    /// decoder's output order: FFmpeg's decision when it took the frame
+    /// from `delayed_pic` ([`Self::select_output`]); for a frame it still
+    /// holds (end of stream, a drained sequence) or never held, the
+    /// decision send_next_delayed_frame (h264dec.c:1057-1058) takes.
+    pub(crate) fn shows(&mut self, id: Option<u32>, recovered: u8) -> bool {
+        if let Some(verdict) = id.and_then(|id| self.verdicts.remove(&id)) {
+            return verdict;
+        }
+        let mut flags = recovered;
+        if let Some(id) = id {
+            self.delayed.retain(|d| d.id != id);
+            flags |= self.flags.remove(&id).unwrap_or(0);
+        }
+        self.frame_recovered |= flags;
+        flags | (self.frame_recovered & RECOVERED_SEI) != 0
+    }
+
+    /// `h->frame_recovered != 0`: a picture has recovered since the
+    /// decoder started or was flushed. FFmpeg paints gap frames gray only
+    /// before then (h264_slice.c:1592).
+    pub(crate) fn any_recovered(&self) -> bool {
+        self.frame_recovered != 0
     }
 
     /// ff_h264_flush_change (h264dec.c:470-472): a decoder flush, or a
@@ -329,12 +459,18 @@ impl Recovery {
         self.recovery_frame = None;
         self.frame_recovered = 0;
         self.reset_poc_history();
+        self.next_outputed_poc = i64::MIN;
+        self.mmco_reset = true;
     }
 
-    /// h264_decode_flush (h264dec.c:480-486): a seek.
+    /// h264_decode_flush (h264dec.c:480-486): a seek. FFmpeg forgets the
+    /// frames waiting for output too.
     pub(crate) fn seek(&mut self) {
         self.flush_change();
         self.sei_recovery_frame_cnt = None;
+        self.delayed.clear();
+        self.flags.clear();
+        self.verdicts.clear();
     }
 }
 
@@ -346,7 +482,7 @@ mod tests {
     fn idr_recovers_every_later_picture() {
         let mut r = Recovery::default();
         assert_eq!(r.picture_start(3, 4, false, false, true), 0);
-        assert!(!r.output(0));
+        assert!(!r.shows(None, 0));
         let idr = r.picture_start(0, 4, true, true, true);
         assert_eq!(idr, RECOVERED_IDR);
         assert_eq!(r.picture_start(1, 4, false, false, true), RECOVERED_IDR);
@@ -361,14 +497,14 @@ mod tests {
         assert_eq!(r.picture_start(5, 4, false, false, true), 0);
         r.packet_start(false);
         assert_eq!(r.picture_start(6, 4, false, false, true), 0);
-        assert!(!r.output(0));
+        assert!(!r.shows(None, 0));
         r.packet_start(false);
         let recovery = r.picture_start(7, 4, false, false, true);
         assert_eq!(recovery, RECOVERED_SEI);
         // A picture decoded before the recovery frame but output after
         // it is recovered at its turn.
-        assert!(r.output(recovery));
-        assert!(r.output(0));
+        assert!(r.shows(None, recovery));
+        assert!(r.shows(None, 0));
     }
 
     #[test]
@@ -440,5 +576,39 @@ mod tests {
         r.picture_start(0, 4, true, true, true);
         r.flush_change();
         assert_eq!(r.picture_start(1, 4, false, false, true), 0);
+    }
+
+    /// FFmpeg takes a frame out of `delayed_pic` when a later frame
+    /// starts, here once three frames wait (two of reorder delay), and
+    /// only the frames that start after an I frame recovered by the
+    /// heuristic is taken out are recovered. The stream is entered at an
+    /// x264 open-GOP I frame (POC 36) followed by two leading B frames
+    /// (32, 34), a P frame (42) and B frames (38, 40).
+    #[test]
+    fn output_decisions_follow_ffmpegs_delayed_pic() {
+        let mut r = Recovery::default();
+        r.set_container_reorder_depth(2);
+        let start = |r: &mut Recovery, id: u32, frame_num: u32, poc: i32, intra: bool| {
+            let flags = r.picture_start(frame_num, 4, intra, false, true);
+            r.select_output(id, poc, false, false, flags);
+            flags
+        };
+        assert_eq!(start(&mut r, 0, 1, 36, true), 0);
+        // The I frame's marking: an unmarked random access point.
+        r.add_flags(0, RECOVERED_HEURISTIC);
+        assert_eq!(start(&mut r, 1, 2, 32, false), 0);
+        // FFmpeg takes out POC 32, then 34: both unrecovered.
+        assert_eq!(start(&mut r, 2, 3, 34, false), 0);
+        assert_eq!(start(&mut r, 3, 3, 42, false), 0);
+        // Starting POC 38 takes out the I frame; 38 itself started before.
+        assert_eq!(start(&mut r, 4, 4, 38, false), 0);
+        assert_eq!(start(&mut r, 5, 5, 40, false), RECOVERED_HEURISTIC);
+        // Whenever this decoder outputs them, FFmpeg's decisions stand.
+        assert_eq!(
+            [1, 2, 0].map(|id| r.shows(Some(id), 0)),
+            [false, false, true]
+        );
+        // P 42 and B 38 are still waiting: decided at the end, unrecovered.
+        assert_eq!([4, 3].map(|id| r.shows(Some(id), 0)), [false, false]);
     }
 }
