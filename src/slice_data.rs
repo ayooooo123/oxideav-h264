@@ -51,6 +51,29 @@ use crate::macroblock_layer::{
     EntropyState, Macroblock, MacroblockLayerError, MbType, PcmSamples,
 };
 use crate::mb_address::mbaff_pair_neighbour_addrs;
+use std::sync::LazyLock;
+
+static CTX17_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some());
+static BIN_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some());
+static SKIP_TRACE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some());
+
+#[inline(always)]
+fn ctx17_trace_enabled() -> bool {
+    *CTX17_TRACE
+}
+
+#[inline(always)]
+fn bin_trace_enabled() -> bool {
+    *BIN_TRACE
+}
+
+#[inline(always)]
+fn skip_trace_enabled() -> bool {
+    *SKIP_TRACE
+}
 use crate::pps::Pps;
 use crate::slice_header::{SliceHeader, SliceType};
 use crate::sps::Sps;
@@ -287,7 +310,7 @@ fn parse_slice_data_impl(
             },
             slice_qp_y,
         )?;
-        if std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some() {
+        if ctx17_trace_enabled() {
             let c17 = ctxs.at(17);
             eprintln!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
                 kind, slice_header.cabac_init_idc, slice_qp_y,
@@ -315,7 +338,7 @@ fn parse_slice_data_impl(
             // Debug marker for bin-level trace: emit a MB-boundary line
             // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
             // slice the bin trace into MB segments.
-            if std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some() {
+            if bin_trace_enabled() {
                 let (bp_byte, bp_bit) = cabac_dec.position();
                 let bit_pos = bp_byte * 8 + bp_bit as usize;
                 eprintln!(
@@ -377,7 +400,7 @@ fn parse_slice_data_impl(
                 // decision with its neighbour condTermFlags for
                 // cross-referencing against an external reference trace.
                 // Useful when chasing CABAC state divergences at specific MBs.
-                if std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some() {
+                if skip_trace_enabled() {
                     eprintln!(
                         "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
                         curr_mb_addr,

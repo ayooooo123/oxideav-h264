@@ -163,22 +163,36 @@ fn build_h_strip(
 ) {
     let n_int = w + 5; // taps -2..+3 → 6 contiguous samples per output
     let nrows = h + 5;
+    let inside_x = int_x >= 2 && int_x + w as i32 + 3 <= src_w as i32;
     for r in 0..nrows {
         let iy_abs = int_y + r as i32 - 2;
-        let iy = clip3(0, src_h as i32 - 1, iy_abs) as usize;
-        // Materialise the integer row covering taps -2..+3 around int_x..int_x+w.
-        fill_row(&mut ws.int_row, src, src_stride, src_w, iy, int_x, n_int);
-        // Apply the H-FIR.
         let strip_row = &mut ws.h_strip[r];
-        for i in 0..w {
-            strip_row[i] = tap6(
-                ws.int_row[i],
-                ws.int_row[i + 1],
-                ws.int_row[i + 2],
-                ws.int_row[i + 3],
-                ws.int_row[i + 4],
-                ws.int_row[i + 5],
-            );
+        if inside_x && iy_abs >= 0 && (iy_abs as usize) < src_h {
+            let row_start = (iy_abs as usize) * src_stride + (int_x - 2) as usize;
+            let src_row = &src[row_start..row_start + n_int];
+            for i in 0..w {
+                strip_row[i] = tap6(
+                    src_row[i],
+                    src_row[i + 1],
+                    src_row[i + 2],
+                    src_row[i + 3],
+                    src_row[i + 4],
+                    src_row[i + 5],
+                );
+            }
+        } else {
+            let iy = clip3(0, src_h as i32 - 1, iy_abs) as usize;
+            fill_row(&mut ws.int_row, src, src_stride, src_w, iy, int_x, n_int);
+            for i in 0..w {
+                strip_row[i] = tap6(
+                    ws.int_row[i],
+                    ws.int_row[i + 1],
+                    ws.int_row[i + 2],
+                    ws.int_row[i + 3],
+                    ws.int_row[i + 4],
+                    ws.int_row[i + 5],
+                );
+            }
         }
     }
 }
@@ -317,8 +331,21 @@ pub fn interpolate_luma(
     }
     let max_v = (1i32 << bit_depth) - 1;
 
+    let inside = int_x >= 2
+        && (int_x + wu as i32 + 3) <= src_width as i32
+        && int_y >= 2
+        && (int_y + hu as i32 + 3) <= src_height as i32;
+
     // Pure-integer (0,0): a strided copy with edge replication.
     if x_frac == 0 && y_frac == 0 {
+        if inside {
+            for yl in 0..hu {
+                let row_base = (int_y + yl as i32) as usize * src_stride + int_x as usize;
+                dst[yl * dst_stride..yl * dst_stride + wu]
+                    .copy_from_slice(&src[row_base..row_base + wu]);
+            }
+            return Ok(());
+        }
         for yl in 0..hu {
             let iy = clip3(0, src_height as i32 - 1, int_y + yl as i32) as usize;
             let row_base = iy * src_stride;
@@ -340,6 +367,26 @@ pub fn interpolate_luma(
 
     // Pure-horizontal half-pel (2, 0).
     if x_frac == 2 && y_frac == 0 {
+        if inside {
+            for yl in 0..hu {
+                let row_start =
+                    (int_y + yl as i32) as usize * src_stride + (int_x - 2) as usize;
+                let row = &src[row_start..row_start + wu + 5];
+                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+                for i in 0..wu {
+                    let b1 = tap6(
+                        row[i],
+                        row[i + 1],
+                        row[i + 2],
+                        row[i + 3],
+                        row[i + 4],
+                        row[i + 5],
+                    );
+                    drow[i] = clip1((b1 + 16) >> 5, max_v);
+                }
+            }
+            return Ok(());
+        }
         let mut ws = LumaWs::new();
         fill_b(
             src, src_stride, src_width, src_height, int_x, int_y, wu, hu, max_v, dst, dst_stride,
@@ -350,39 +397,197 @@ pub fn interpolate_luma(
 
     // Pure-vertical half-pel (0, 2).
     if x_frac == 0 && y_frac == 2 {
+        if inside {
+            for yl in 0..hu {
+                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+                let base =
+                    ((int_y + yl as i32 - 2) as usize) * src_stride + int_x as usize;
+                let s0 = &src[base..base + wu];
+                let s1 = &src[base + src_stride..base + src_stride + wu];
+                let s2 = &src[base + 2 * src_stride..base + 2 * src_stride + wu];
+                let s3 = &src[base + 3 * src_stride..base + 3 * src_stride + wu];
+                let s4 = &src[base + 4 * src_stride..base + 4 * src_stride + wu];
+                let s5 = &src[base + 5 * src_stride..base + 5 * src_stride + wu];
+                for i in 0..wu {
+                    let h1 = tap6(s0[i], s1[i], s2[i], s3[i], s4[i], s5[i]);
+                    drow[i] = clip1((h1 + 16) >> 5, max_v);
+                }
+            }
+            return Ok(());
+        }
         fill_h_vert(
             src, src_stride, src_width, src_height, int_x, int_y, wu, hu, max_v, dst, dst_stride,
         );
         return Ok(());
     }
 
-    // Everything else needs at most: a `b` value at (x, y), a `b` value
-    // at (x, y+1) (for s/p/q/r/n quarter-pel), a `h` (vertical) at (x, y),
-    // a `h` at (x+1, y) (for m, used in 3,*), a `j` (diagonal) at (x, y).
-    //
-    // For the diagonal-bearing positions (x_frac == 2 || y_frac == 2,
-    // and at least one of them being 1/3 makes things mixed) we build
-    // the H-strip once, then derive everything from it.
-    //
-    // Strategy: always build the H-FIR strip when we need any `b` /
-    // `j` / `s` / `m`-derived value (which is essentially every
-    // non-(0,0)/(0,2)/(2,0) position). Then assemble the position.
+    // Horizontal quarter-pel (1, 0) = a: G + b averaged.
+    if x_frac == 1 && y_frac == 0 {
+        if inside {
+            for yl in 0..hu {
+                let row_start =
+                    (int_y + yl as i32) as usize * src_stride + (int_x - 2) as usize;
+                let row = &src[row_start..row_start + wu + 5];
+                let g_row = &src[row_start + 2..row_start + 2 + wu];
+                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+                for i in 0..wu {
+                    let b1 = tap6(
+                        row[i],
+                        row[i + 1],
+                        row[i + 2],
+                        row[i + 3],
+                        row[i + 4],
+                        row[i + 5],
+                    );
+                    let b_s = clip1((b1 + 16) >> 5, max_v);
+                    drow[i] = (g_row[i] + b_s + 1) >> 1;
+                }
+            }
+            return Ok(());
+        }
+        let mut ws = LumaWs::new();
+        let n_int = wu + 5;
+        let xmax = src_width as i32 - 1;
+        for yl in 0..hu {
+            let iy = clip3(0, src_height as i32 - 1, int_y + yl as i32) as usize;
+            fill_row(&mut ws.int_row, src, src_stride, src_width, iy, int_x, n_int);
+            let row_base = iy * src_stride;
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                let b1 = tap6(
+                    ws.int_row[i],
+                    ws.int_row[i + 1],
+                    ws.int_row[i + 2],
+                    ws.int_row[i + 3],
+                    ws.int_row[i + 4],
+                    ws.int_row[i + 5],
+                );
+                let cx = clip3(0, xmax, int_x + i as i32) as usize;
+                let g = src[row_base + cx];
+                let b_s = clip1((b1 + 16) >> 5, max_v);
+                drow[i] = (g + b_s + 1) >> 1;
+            }
+        }
+        return Ok(());
+    }
+
+    // Horizontal quarter-pel (3, 0) = c: H (G at x+1) + b averaged.
+    if x_frac == 3 && y_frac == 0 {
+        if inside {
+            for yl in 0..hu {
+                let row_start =
+                    (int_y + yl as i32) as usize * src_stride + (int_x - 2) as usize;
+                let row = &src[row_start..row_start + wu + 5];
+                let h_row = &src[row_start + 3..row_start + 3 + wu];
+                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+                for i in 0..wu {
+                    let b1 = tap6(
+                        row[i],
+                        row[i + 1],
+                        row[i + 2],
+                        row[i + 3],
+                        row[i + 4],
+                        row[i + 5],
+                    );
+                    let b_s = clip1((b1 + 16) >> 5, max_v);
+                    drow[i] = (h_row[i] + b_s + 1) >> 1;
+                }
+            }
+            return Ok(());
+        }
+        let mut ws = LumaWs::new();
+        let n_int = wu + 5;
+        let xmax = src_width as i32 - 1;
+        for yl in 0..hu {
+            let iy = clip3(0, src_height as i32 - 1, int_y + yl as i32) as usize;
+            fill_row(&mut ws.int_row, src, src_stride, src_width, iy, int_x, n_int);
+            let row_base = iy * src_stride;
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                let b1 = tap6(
+                    ws.int_row[i],
+                    ws.int_row[i + 1],
+                    ws.int_row[i + 2],
+                    ws.int_row[i + 3],
+                    ws.int_row[i + 4],
+                    ws.int_row[i + 5],
+                );
+                let xi = int_x + i as i32 + 1;
+                let cx = clip3(0, xmax, xi) as usize;
+                let h_int = src[row_base + cx];
+                let b_s = clip1((b1 + 16) >> 5, max_v);
+                drow[i] = (h_int + b_s + 1) >> 1;
+            }
+        }
+        return Ok(());
+    }
+
+    // Vertical quarter-pel: (0, 1) = d: G + h averaged.  (0, 3) = n: M + h averaged.
+    if (x_frac == 0 && y_frac == 1) || (x_frac == 0 && y_frac == 3) {
+        if inside {
+            let g_offset = if y_frac == 1 { 2 } else { 3 };
+            for yl in 0..hu {
+                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+                let base =
+                    ((int_y + yl as i32 - 2) as usize) * src_stride + int_x as usize;
+                let s0 = &src[base..base + wu];
+                let s1 = &src[base + src_stride..base + src_stride + wu];
+                let s2 = &src[base + 2 * src_stride..base + 2 * src_stride + wu];
+                let s3 = &src[base + 3 * src_stride..base + 3 * src_stride + wu];
+                let s4 = &src[base + 4 * src_stride..base + 4 * src_stride + wu];
+                let s5 = &src[base + 5 * src_stride..base + 5 * src_stride + wu];
+                let g = &src[base + g_offset * src_stride..base + g_offset * src_stride + wu];
+                for i in 0..wu {
+                    let h1 = tap6(s0[i], s1[i], s2[i], s3[i], s4[i], s5[i]);
+                    let h_s = clip1((h1 + 16) >> 5, max_v);
+                    drow[i] = (g[i] + h_s + 1) >> 1;
+                }
+            }
+            return Ok(());
+        }
+        let mut col_strip: [[i32; MAX_W]; MAX_H] = [[0; MAX_W]; MAX_H];
+        let nrows = hu + 5;
+        for r in 0..nrows {
+            let iy = clip3(0, src_height as i32 - 1, int_y + r as i32 - 2) as usize;
+            integer_row_at(
+                src,
+                src_stride,
+                src_width,
+                src_height,
+                int_x,
+                iy as i32,
+                0,
+                wu,
+                &mut col_strip[r],
+            );
+        }
+        let g_offset = if y_frac == 1 { 0 } else { 1 };
+        for yl in 0..hu {
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                let h1 = tap6(
+                    col_strip[yl][i],
+                    col_strip[yl + 1][i],
+                    col_strip[yl + 2][i],
+                    col_strip[yl + 3][i],
+                    col_strip[yl + 4][i],
+                    col_strip[yl + 5][i],
+                );
+                let h_s = clip1((h1 + 16) >> 5, max_v);
+                let g = col_strip[yl + 2 + g_offset][i];
+                drow[i] = (g + h_s + 1) >> 1;
+            }
+        }
+        return Ok(());
+    }
+
+    // Only diagonal-bearing positions reach here. Build H-FIR strip once.
     let mut ws = LumaWs::new();
     build_h_strip(
         src, src_stride, src_width, src_height, int_x, int_y, wu, hu, &mut ws,
     );
 
-    // Helpers to read intermediates from the strip.
-    // strip[yl + 2][xl] is the H-FIR b1 intermediate at the *target*
-    // integer location (xl, yl). The strip rows -2..+2 cover y-2..y+2;
-    // strip rows -2 corresponds to ws.h_strip[0], ..., strip row +2 is
-    // ws.h_strip[4], the target row (offset 0) is ws.h_strip[2], and
-    // row +1 is ws.h_strip[3].
-
-    // Apply the H-strip to assemble the requested position.
     match (x_frac, y_frac) {
-        // (2, 0) handled above.
-        // (0, 2) handled above.
         // (2, 2): j only — V-FIR over rows -2..+3 of the H-strip.
         (2, 2) => {
             for yl in 0..hu {
@@ -396,81 +601,6 @@ pub fn interpolate_luma(
                 for i in 0..wu {
                     let j1 = tap6(r0[i], r1[i], r2[i], r3[i], r4[i], r5[i]);
                     drow[i] = clip1((j1 + 512) >> 10, max_v);
-                }
-            }
-        }
-        // (1, 0) = a: G + b averaged.
-        (1, 0) => {
-            for yl in 0..hu {
-                let b_row = &ws.h_strip[yl + 2]; // y-offset 0 in strip = row 2
-                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
-                let iy = clip3(0, src_height as i32 - 1, int_y + yl as i32) as usize;
-                let row_base = iy * src_stride;
-                let xmax = src_width as i32 - 1;
-                for i in 0..wu {
-                    let cx = if int_x >= 0 && int_x + i as i32 <= xmax {
-                        (int_x + i as i32) as usize
-                    } else {
-                        clip3(0, xmax, int_x + i as i32) as usize
-                    };
-                    let g = src[row_base + cx];
-                    let b_s = clip1((b_row[i] + 16) >> 5, max_v);
-                    drow[i] = (g + b_s + 1) >> 1;
-                }
-            }
-        }
-        // (3, 0) = c: H (G at x+1) + b averaged.
-        (3, 0) => {
-            for yl in 0..hu {
-                let b_row = &ws.h_strip[yl + 2];
-                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
-                let iy = clip3(0, src_height as i32 - 1, int_y + yl as i32) as usize;
-                let row_base = iy * src_stride;
-                let xmax = src_width as i32 - 1;
-                for i in 0..wu {
-                    let xi = int_x + i as i32 + 1;
-                    let cx = clip3(0, xmax, xi) as usize;
-                    let h_int = src[row_base + cx];
-                    let b_s = clip1((b_row[i] + 16) >> 5, max_v);
-                    drow[i] = (h_int + b_s + 1) >> 1;
-                }
-            }
-        }
-        // (0, 1) = d: G + h averaged.  (0, 3) = n: M + h averaged.
-        (0, 1) | (0, 3) => {
-            // Need vertical FIR per output row; reuse the column-strip
-            // approach of fill_h_vert but combined with G or M.
-            let mut col_strip: [[i32; MAX_W]; MAX_H] = [[0; MAX_W]; MAX_H];
-            let nrows = hu + 5;
-            for r in 0..nrows {
-                let iy = clip3(0, src_height as i32 - 1, int_y + r as i32 - 2) as usize;
-                integer_row_at(
-                    src,
-                    src_stride,
-                    src_width,
-                    src_height,
-                    int_x,
-                    iy as i32,
-                    0,
-                    wu,
-                    &mut col_strip[r],
-                );
-            }
-            let g_offset = if y_frac == 1 { 0 } else { 1 };
-            for yl in 0..hu {
-                let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
-                for i in 0..wu {
-                    let h1 = tap6(
-                        col_strip[yl][i],
-                        col_strip[yl + 1][i],
-                        col_strip[yl + 2][i],
-                        col_strip[yl + 3][i],
-                        col_strip[yl + 4][i],
-                        col_strip[yl + 5][i],
-                    );
-                    let h_s = clip1((h1 + 16) >> 5, max_v);
-                    let g = col_strip[yl + 2 + g_offset][i];
-                    drow[i] = (g + h_s + 1) >> 1;
                 }
             }
         }
@@ -684,6 +814,33 @@ pub fn interpolate_chroma(
             let row_base = iy * src_stride + int_x as usize;
             dst[yl * dst_stride..yl * dst_stride + wu]
                 .copy_from_slice(&src[row_base..row_base + wu]);
+        }
+        return Ok(());
+    }
+    if inside && xf == 0 {
+        for yl in 0..hu {
+            let iy = (int_y + yl as i32) as usize;
+            let row_a = iy * src_stride + int_x as usize;
+            let row_c = (iy + 1) * src_stride + int_x as usize;
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                let sa = src[row_a + i];
+                let sc = src[row_c + i];
+                drow[i] = (w8myf * sa + yf * sc + 4) >> 3;
+            }
+        }
+        return Ok(());
+    }
+    if inside && yf == 0 {
+        for yl in 0..hu {
+            let iy = (int_y + yl as i32) as usize;
+            let row_a = iy * src_stride + int_x as usize;
+            let drow = &mut dst[yl * dst_stride..yl * dst_stride + wu];
+            for i in 0..wu {
+                let sa = src[row_a + i];
+                let sb = src[row_a + i + 1];
+                drow[i] = (w8mxf * sa + xf * sb + 4) >> 3;
+            }
         }
         return Ok(());
     }
