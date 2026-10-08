@@ -142,14 +142,14 @@ pub(crate) struct MarkedPicture {
 /// A frame in FFmpeg's `delayed_pic`: its id, POC, and whether it opens a
 /// new output run (an IDR frame, or `mmco_reset`: after MMCO 5, a flush,
 /// or a rejected POC).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Delayed {
     id: u32,
     poc: i32,
     boundary: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Recovery {
     /// `h->sei.recovery_point.recovery_frame_cnt` (`None` for -1): the
     /// recovery point SEI of the current packet.
@@ -174,7 +174,7 @@ pub(crate) struct Recovery {
     next_outputed_poc: i64,
     /// `h->mmco_reset`: the next frame opens an output run.
     mmco_reset: bool,
-    /// The live recovery flags of the frames in `delayed`, by id.
+    /// Flags of undecided frames, including out-of-order fallback, by id.
     flags: HashMap<u32, u8>,
     /// Whether FFmpeg outputs the frames it took from `delayed`, by id.
     verdicts: HashMap<u32, bool>,
@@ -201,6 +201,25 @@ impl Default for Recovery {
 }
 
 impl Recovery {
+    /// Start an independent plane decoder with the same recovery state,
+    /// but no records for pictures owned by the original decoder.
+    pub(crate) fn for_new_decoder(&self) -> Self {
+        Self {
+            sei_recovery_frame_cnt: self.sei_recovery_frame_cnt,
+            recovery_frame: self.recovery_frame,
+            valid_recovery_point: self.valid_recovery_point,
+            frame_recovered: self.frame_recovered,
+            has_recovery_point: self.has_recovery_point,
+            has_b_frames: self.has_b_frames,
+            last_pocs: self.last_pocs,
+            delayed: Vec::new(),
+            next_outputed_poc: self.next_outputed_poc,
+            mmco_reset: self.mmco_reset,
+            flags: HashMap::new(),
+            verdicts: HashMap::new(),
+        }
+    }
+
     /// decode_nal_units (h264dec.c:617-623): a packet starts without the
     /// previous packet's SEI unless it completes a field pair.
     pub(crate) fn packet_start(&mut self, awaiting_second_field: bool) {
@@ -428,6 +447,16 @@ impl Recovery {
         0
     }
 
+    /// Retire a picture that will never reach `shows`. Decisions already
+    /// taken and recovery state for other pictures are left unchanged.
+    pub(crate) fn retire(&mut self, id: Option<u32>) {
+        if let Some(id) = id {
+            self.delayed.retain(|d| d.id != id);
+            self.flags.remove(&id);
+            self.verdicts.remove(&id);
+        }
+    }
+
     /// Whether a frame with these flags is output at its turn in this
     /// decoder's output order: FFmpeg's decision when it took the frame
     /// from `delayed_pic` ([`Self::select_output`]); for a frame it still
@@ -471,6 +500,12 @@ impl Recovery {
         self.delayed.clear();
         self.flags.clear();
         self.verdicts.clear();
+    }
+
+    /// Live per-picture records, in (delayed, flags, verdicts) order.
+    #[cfg(test)]
+    pub(crate) fn record_counts(&self) -> (usize, usize, usize) {
+        (self.delayed.len(), self.flags.len(), self.verdicts.len())
     }
 }
 
@@ -610,5 +645,16 @@ mod tests {
         );
         // P 42 and B 38 are still waiting: decided at the end, unrecovered.
         assert_eq!([4, 3].map(|id| r.shows(Some(id), 0)), [false, false]);
+    }
+
+    #[test]
+    fn out_of_order_frame_keeps_fallback_flags_until_release() {
+        let mut r = Recovery::default();
+        r.select_output(0, 4, false, false, 0);
+        assert!(!r.shows(Some(0), 0));
+        r.select_output(1, 2, false, false, RECOVERED_HEURISTIC);
+        assert_eq!(r.record_counts(), (0, 1, 0));
+        assert!(r.shows(Some(1), 0));
+        assert_eq!(r.record_counts(), (0, 0, 0));
     }
 }

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (PearTube fork)
 
+- decoder: retire output IDs from every recovery collection (`delayed`,
+  `flags`, `verdicts`) when an all-failed or incomplete picture is
+  abandoned, or when a field pair supersedes an earlier field ID.
+  Separate-colour-plane decoders inherit recovery state, not records
+  for pictures owned by their parent. This prevents metadata from
+  accumulating after the pictures themselves were discarded. Bounded
+  16×16 lifecycle tests track live records; reset and output drains keep
+  their existing recovery decisions and frame output.
+
 - decoder: a stream entered at a non-IDR picture (a seek, a cut, a lost
   picture) decodes as FFmpeg 2da55bf does (LGPL ports):
   - frame_num gaps (h264_slice.c `h264_field_start`): before every
@@ -33,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     decoder keeps FFmpeg's `delayed_pic` alongside its §C.4 output and
     takes each frame's recovered/shown decision when FFmpeg takes the
     frame out, at a later frame's start, so `frame_recovered` changes at
-    FFmpeg's moment; frames FFmpeg drops as out of order are withheld.
+    FFmpeg's moment. Frames that leave this shadow queue as out of order
+    remain eligible for the recovery-gated fallback at their §C.4 output
+    turn, rather than being unconditionally withheld. This preserves
+    output when the initial reorder depth is too small.
   - `h264_decoder::video_delay`: FFmpeg's `codecpar->video_delay` for H.264
     parameters (the `video_delay` option, else the SPS VUI
     `max_num_reorder_frames`), for seeking as fftools does.
@@ -43,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every slice refused); at its 4 s I frame no frame is output, as in
   FFmpeg (before: 93).
 
-- decoder: pictures FFmpeg 2da55bf does not output are withheld
+- decoder: apply FFmpeg 2da55bf's recovery gate to picture output
   (`src/recovery.rs`, LGPL port): a picture is recovered at an IDR, at
   the frame a recovery point SEI names, or at an unmarked random access
   point whose marking did not fail, and nothing is output before the

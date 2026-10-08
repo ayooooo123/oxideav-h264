@@ -964,10 +964,10 @@ impl H264CodecDecoder {
         let recovery = &self.recovery;
         let scp = self.scp.get_or_insert_with(|| {
             let mut scp = Box::new(ScpState::new(&self.codec_id));
-            // The planes start from what this decoder has seen (a
-            // recovery point SEI ahead of the first slice).
+            // The planes inherit recovery state (e.g. a recovery-point
+            // SEI), not the original decoder's per-picture records.
             for sub in scp.subs.iter_mut() {
-                sub.recovery = recovery.clone();
+                sub.recovery = recovery.for_new_decoder();
             }
             scp
         });
@@ -2064,6 +2064,7 @@ impl H264CodecDecoder {
         // fuzz oracle on `crash-2ad9589f…` (3 non-IDR slices, all
         // fail "CABAC read past end of bitstream").
         if !in_progress.any_slice_succeeded {
+            self.recovery.retire(in_progress.output_id);
             return Ok(());
         }
         // §7.4.2.1 / Annex A — a coded picture must cover every
@@ -2085,6 +2086,7 @@ impl H264CodecDecoder {
         // slice — total coverage ≪ PicSizeInMbs, leaving most of the
         // luma + chroma planes zero on output.
         if in_progress.grid.info.iter().any(|m| !m.available) {
+            self.recovery.retire(in_progress.output_id);
             return Ok(());
         }
         let PictureInProgress {
@@ -2402,6 +2404,12 @@ impl H264CodecDecoder {
             // means the first field was unpaired — emit it on its own and
             // start a fresh pending pair with the current field.
             if prev.is_bottom != field.is_bottom && prev.frame_num == field.frame_num {
+                let id = field.output_id.or(prev.output_id);
+                // An IDR/MMCO-5 drain can leave a pending field with an
+                // ID of its own. Only the selected pair ID survives.
+                if prev.output_id.is_some() && prev.output_id != id {
+                    self.recovery.retire(prev.output_id);
+                }
                 let (top, bottom) = if prev.is_bottom {
                     (&field.pic, &prev.pic)
                 } else {
@@ -2422,7 +2430,7 @@ impl H264CodecDecoder {
                         // FFmpeg's flags belong to the frame both fields
                         // decode into.
                         recovered: prev.recovered | field.recovered,
-                        id: field.output_id.or(prev.output_id),
+                        id,
                     },
                     pic_order_cnt: frame_poc,
                     frame_num: field.frame_num,
@@ -4187,6 +4195,163 @@ mod tests {
             gray: false,
             output_id: None,
         });
+    }
+
+    fn assert_abandoned_recovery_records_retired(any_slice_succeeded: bool) {
+        // One 16x16 picture at a time, four IDs per state. Exercise
+        // decisions already taken, delayed pictures and out-of-order
+        // fallback flags without growing picture buffers or exhausting memory.
+        for (depth, out_of_order, live) in [
+            (0, false, (0, 0, 1)),
+            (2, false, (1, 1, 0)),
+            (0, true, (0, 1, 0)),
+        ] {
+            let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+            dec.recovery.set_container_reorder_depth(depth);
+            if out_of_order {
+                dec.recovery.select_output(100, 16, false, false, 0);
+                assert!(!dec.recovery.shows(Some(100), 0));
+            }
+            for id in 0..4 {
+                seed_in_progress(&mut dec, 1, 0, hdr_base());
+                let picture = dec.in_progress.as_mut().unwrap();
+                picture.any_slice_succeeded = any_slice_succeeded;
+                // The grid has an unavailable MB: a successful slice
+                // still leaves an incomplete picture in the second case.
+                picture.output_id = Some(id);
+                dec.recovery.select_output(id, id as i32 * 2, false, false, 0);
+                assert_eq!(dec.recovery.record_counts(), live);
+                dec.finalize_in_progress_picture().unwrap();
+                assert!(dec.in_progress.is_none());
+                assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+                assert_eq!(
+                    dec.recovery.record_counts(),
+                    (0, 0, 0),
+                    "abandoned ID {id}, succeeded={any_slice_succeeded}, depth={depth}, out_of_order={out_of_order}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_records_retired_for_all_failed_picture() {
+        assert_abandoned_recovery_records_retired(false);
+    }
+
+    #[test]
+    fn recovery_records_retired_for_incomplete_picture() {
+        assert_abandoned_recovery_records_retired(true);
+    }
+
+    #[test]
+    fn recovery_records_retired_for_superseded_field_id() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        // A boundary can leave a field with its own output ID; pairing
+        // it transfers ownership to the new pair ID, not both IDs.
+        for (id, bottom, fill, recovered) in [
+            (10, false, 30, 0),
+            (11, true, 40, crate::recovery::RECOVERED_IDR),
+        ] {
+            dec.recovery.select_output(id, 8, false, false, recovered);
+            let mut f = field(
+                field_pic(16, 4, fill, 128, 8, 3),
+                bottom,
+                3,
+                8,
+                Some(99),
+                FrameCropMargins::default(),
+            );
+            f.output_id = Some(id);
+            f.recovered = 0; // Only the pair ID's recorded verdict shows it.
+            dec.handle_field_output(f);
+        }
+        assert_eq!(dec.recovery.record_counts(), (0, 0, 1));
+        dec.flush().unwrap();
+        let Frame::Video(frame) = dec.receive_frame().unwrap() else {
+            panic!("expected paired video frame");
+        };
+        assert_eq!(frame.pts, Some(99));
+        let luma: Vec<u8> = (0..8)
+            .flat_map(|row| [if row % 2 == 0 { 30 } else { 40 }; 16])
+            .collect();
+        assert_eq!(frame.planes[0].data, luma);
+        assert_eq!(frame.planes[1].data, vec![128; 8 * 4]);
+        assert_eq!(frame.planes[2].data, vec![128; 8 * 4]);
+        assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+        assert_eq!(dec.recovery.record_counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn recovery_records_are_not_inherited_by_separate_planes() {
+        let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+        dec.recovery.set_container_reorder_depth(2);
+        for id in 90..93 {
+            dec.recovery.select_output(id, (id - 90) as i32 * 2, false, false, 0);
+        }
+        dec.recovery.recovery_point_sei(1);
+        let mut sps = test_sps();
+        sps.profile_idc = 244;
+        sps.chroma_format_idc = 3;
+        sps.separate_colour_plane_flag = true;
+        let mut header = hdr_base();
+        header.slice_type = ST::I;
+        header.slice_type_raw = 2;
+        // The empty slice cannot complete even this 16x16 picture.
+        // Whether parsing refuses it or leaves it incomplete, its ID
+        // and the parent's unrelated IDs must not survive in the planes.
+        let _ = dec.route_scp_slice(1, 0, header, Vec::new(), (0, 0), sps, test_pps());
+        let scp = dec.scp.as_mut().expect("separate-plane decoders opened");
+        assert!(scp.subs[0].in_progress.is_some());
+        for sub in scp.subs.iter_mut() {
+            sub.finalize_in_progress_picture().unwrap();
+            assert_eq!(sub.recovery.record_counts(), (0, 0, 0));
+            assert_eq!(
+                sub.recovery.picture_start(1, 4, true, false, true),
+                crate::recovery::RECOVERED_SEI,
+                "the pending recovery-point state must still be inherited"
+            );
+        }
+        assert_eq!(
+            dec.recovery.record_counts(),
+            (2, 2, 1),
+            "the original decoder still owns its picture records"
+        );
+    }
+
+    #[test]
+    fn recovery_records_are_consumed_on_drain_and_reset() {
+        for reset in [false, true] {
+            let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+            dec.recovery.set_container_reorder_depth(2);
+            for (id, poc) in [(0, 0), (1, 4), (2, 2)] {
+                dec.recovery.select_output(id, poc, false, false, 0);
+                let mut picture = vf(id as u8);
+                // A false verdict for ID 0 must override these recovered
+                // flags; the two delayed pictures use the EOF fallback.
+                picture.id = Some(id);
+                assert!(dec.output_dpb.push(OutputEntry {
+                    picture,
+                    pic_order_cnt: poc,
+                    frame_num: id,
+                    needed_for_output: true,
+                }).is_none());
+            }
+            assert_eq!(dec.recovery.record_counts(), (2, 2, 1));
+            if reset {
+                seed_in_progress(&mut dec, 1, 0, hdr_base());
+                dec.in_progress.as_mut().unwrap().output_id = Some(3);
+                dec.recovery.select_output(3, 6, false, false, 0);
+                dec.reset().unwrap();
+                assert!(dec.in_progress.is_none());
+                assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+            } else {
+                dec.flush().unwrap();
+                assert_eq!(vf_tag(&dec.receive_frame().unwrap()), 2);
+                assert_eq!(vf_tag(&dec.receive_frame().unwrap()), 1);
+                assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+            }
+            assert_eq!(dec.recovery.record_counts(), (0, 0, 0));
+        }
     }
 
     /// §7.4.1.2.4 — no picture in progress ⇒ any slice starts a new
