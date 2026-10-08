@@ -9440,7 +9440,8 @@ fn deblock_plane_luma_non_mbaff(
                 let p_qp = p_info.qp_y;
                 let q_qp = q_info.qp_y;
 
-                if p_info.is_intra || q_info.is_intra {
+                let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
+                if intra_or_spsi {
                     let bs = if is_mb_edge { 4 } else { 3 };
                     for seg in 0..4 {
                         let y0 = mb_y * 16 + seg * 4;
@@ -9467,8 +9468,6 @@ fn deblock_plane_luma_non_mbaff(
                         let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                         let bs = if p_has_nz || q_has_nz {
                             2
-                        } else if p_info.in_sp_si_slice || q_info.in_sp_si_slice {
-                            if is_mb_edge { 4 } else { 3 }
                         } else if different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9513,7 +9512,8 @@ fn deblock_plane_luma_non_mbaff(
                 let p_qp = p_info.qp_y;
                 let q_qp = q_info.qp_y;
 
-                if p_info.is_intra || q_info.is_intra {
+                let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
+                if intra_or_spsi {
                     let bs = if is_mb_edge { 4 } else { 3 };
                     for seg in 0..4 {
                         let x0 = mb_x * 16 + seg * 4;
@@ -9540,8 +9540,6 @@ fn deblock_plane_luma_non_mbaff(
                         let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                         let bs = if p_has_nz || q_has_nz {
                             2
-                        } else if p_info.in_sp_si_slice || q_info.in_sp_si_slice {
-                            if is_mb_edge { 4 } else { 3 }
                         } else if different_ref_or_mv_luma(
                             p_info,
                             q_info,
@@ -9618,7 +9616,8 @@ fn deblock_plane_chroma_non_mbaff(
 
                     let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, offset, qp_bd_offset_c);
 
-                    if p_info.is_intra || q_info.is_intra {
+                    let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
+                    if intra_or_spsi {
                         let bs = if is_mb_edge { 4 } else { 3 };
                         for seg_off in (0..chroma_mb_h).step_by(4) {
                             for sub in 0..sub_seg_count {
@@ -9649,8 +9648,6 @@ fn deblock_plane_chroma_non_mbaff(
                                 let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                                 let bs = if p_has_nz || q_has_nz {
                                     2
-                                } else if p_info.in_sp_si_slice || q_info.in_sp_si_slice {
-                                    if is_mb_edge { 4 } else { 3 }
                                 } else if different_ref_or_mv_luma(
                                     p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y, field_pic,
                                 ) {
@@ -9689,7 +9686,8 @@ fn deblock_plane_chroma_non_mbaff(
                     let sub_seg_cols = 4usize / sub_w as usize;
                     let sub_seg_count_h = 4usize / sub_seg_cols;
 
-                    if p_info.is_intra || q_info.is_intra {
+                    let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
+                    if intra_or_spsi {
                         let bs = if is_mb_edge { 4 } else { 3 };
                         for seg_off in (0..chroma_mb_w).step_by(4) {
                             for sub in 0..sub_seg_count_h {
@@ -9720,8 +9718,6 @@ fn deblock_plane_chroma_non_mbaff(
                                 let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
                                 let bs = if p_has_nz || q_has_nz {
                                     2
-                                } else if p_info.in_sp_si_slice || q_info.in_sp_si_slice {
-                                    if is_mb_edge { 4 } else { 3 }
                                 } else if different_ref_or_mv_luma(
                                     p_info, q_info, p_in_mb_x, p_in_mb_y, q_in_mb_x, q_in_mb_y, field_pic,
                                 ) {
