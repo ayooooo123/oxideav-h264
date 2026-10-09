@@ -2638,7 +2638,7 @@ fn reconstruct_chroma_intra(
         // 1 (horizontal) / 2 (vertical) → horPredFlag = 2 − mode.
         if bypass && (chroma_mode_idx == 1 || chroma_mode_idx == 2) {
             intra_bypass_dpcm(
-                &mut rmb,
+                &mut rmb[..(mbw_c * mbh_c) as usize],
                 mbw_c as usize,
                 mbh_c as usize,
                 chroma_mode_idx == 1,
@@ -9514,7 +9514,7 @@ fn deblock_plane_luma_non_mbaff(
 
                 let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
                 if intra_or_spsi {
-                    let bs = if is_mb_edge { 4 } else { 3 };
+                    let bs = if is_mb_edge && !field_pic { 4 } else { 3 };
                     for seg in 0..4 {
                         let x0 = mb_x * 16 + seg * 4;
                         if x0 >= w {
@@ -9688,7 +9688,7 @@ fn deblock_plane_chroma_non_mbaff(
 
                     let intra_or_spsi = p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice;
                     if intra_or_spsi {
-                        let bs = if is_mb_edge { 4 } else { 3 };
+                        let bs = if is_mb_edge && !field_pic { 4 } else { 3 };
                         for seg_off in (0..chroma_mb_w).step_by(4) {
                             for sub in 0..sub_seg_count_h {
                                 let x0 = mb_x * chroma_mb_w + seg_off + (sub * sub_seg_cols) as i32;
@@ -11248,7 +11248,6 @@ fn filter_horizontal_edge_luma(
             if bs < 4 {
                 let tc0 = tc0_from(bs, index_a, bit_depth);
                 for dx in 0..4 {
-                    let x = (x0 + dx) as usize;
                     let p2 = pic.luma[p2_offset + dx];
                     let p1 = pic.luma[p1_offset + dx];
                     let p0 = pic.luma[p0_offset + dx];
@@ -11275,7 +11274,6 @@ fn filter_horizontal_edge_luma(
             } else {
                 let alpha_thresh = (alpha >> 2) + 2;
                 for dx in 0..4 {
-                    let x = (x0 + dx) as usize;
                     let p3 = pic.luma[p3_offset + dx];
                     let p2 = pic.luma[p2_offset + dx];
                     let p1 = pic.luma[p1_offset + dx];
@@ -12543,6 +12541,93 @@ mod tests {
         assert_eq!(m[8], 13, "idx 2 → c10");
         assert_eq!(m[8 + 2], 17, "idx 7 → c12");
         assert_eq!(m[7 * 8 + 7], 77, "idx 63 → c77");
+    }
+
+    #[test]
+    fn horizontal_field_boundaries_use_normal_intra_filter() {
+        for chroma_type in [1, 2] {
+            for field_pic in [false, true] {
+                for sp_si in [false, true] {
+                    let mut pic = Picture::new(16, 32, chroma_type, 8, 8);
+                    for y in 0..32 {
+                        for x in 0..16 {
+                            pic.set_luma(x, y, if y < 16 { 100 } else { 115 });
+                        }
+                    }
+                    let boundary = pic.chroma_height() as i32 / 2;
+                    for y in 0..pic.chroma_height() as i32 {
+                        for x in 0..pic.chroma_width() as i32 {
+                            let value = if y < boundary { 100 } else { 115 };
+                            pic.set_cb(x, y, value);
+                            pic.set_cr(x, y, value);
+                        }
+                    }
+                    let mut grid = MbGrid::new(1, 2);
+                    for info in &mut grid.info {
+                        *info = mk_intra4x4_info(2);
+                        info.is_intra = !sp_si;
+                        info.in_sp_si_slice = sp_si;
+                        info.qp_y = 46;
+                    }
+                    deblock_picture_full(
+                        &mut pic, &grid, 0, 0, 8, 8, &make_pps(),
+                        false, field_pic, &[false, false],
+                    );
+                    // For the 100|115 step, bS=3 leaves luma p2 alone and
+                    // changes chroma p0 by 6. Frame bS=4 changes them by 2/4.
+                    for x in 0..16 {
+                        assert_eq!(pic.luma_at(x, 13), if field_pic { 100 } else { 102 });
+                    }
+                    for x in 0..pic.chroma_width() as i32 {
+                        let expected = if field_pic { 106 } else { 104 };
+                        assert_eq!(pic.cb_at(x, boundary - 1), expected);
+                        assert_eq!(pic.cr_at(x, boundary - 1), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_subsampled_chroma_preserves_neighbor_pixels() {
+        for chroma_type in [1, 2] {
+            for chroma_mode in [1, 2] {
+                let mut sps = make_sps(2, 2);
+                sps.profile_idc = 244;
+                sps.chroma_format_idc = chroma_type;
+                sps.qpprime_y_zero_transform_bypass_flag = true;
+                let mut sh = make_slice_header();
+                sh.slice_qp_delta = -26;
+                sh.disable_deblocking_filter_idc = 1;
+                let chroma_mb_height = if chroma_type == 1 { 8 } else { 16 };
+                let mut macroblocks = Vec::new();
+                for _ in 0..3 {
+                    let mut mb = make_empty_ipcm_mb();
+                    let pcm = mb.pcm_samples.as_mut().unwrap();
+                    pcm.chroma_cb.resize(8 * chroma_mb_height, 100);
+                    pcm.chroma_cr.resize(8 * chroma_mb_height, 200);
+                    macroblocks.push(mb);
+                }
+                let mut mb = make_intra16x16_dc_mb(2);
+                mb.mb_pred.as_mut().unwrap().intra_chroma_pred_mode = chroma_mode;
+                macroblocks.push(mb);
+                let data = SliceData {
+                    macroblocks,
+                    mb_field_decoding_flags: vec![false; 4],
+                    last_mb_addr: 3,
+                };
+                let mut pic = Picture::new(32, 32, chroma_type, 8, 8);
+                reconstruct_slice(
+                    &data, &sh, &sps, &make_pps(), &NoRefs, &mut pic, &mut MbGrid::new(2, 2),
+                ).unwrap();
+                for y in chroma_mb_height..2 * chroma_mb_height {
+                    for x in 8..16 {
+                        assert_eq!(pic.cb_at(x, y as i32), 100);
+                        assert_eq!(pic.cr_at(x, y as i32), 200);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

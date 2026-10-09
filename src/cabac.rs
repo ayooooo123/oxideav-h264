@@ -517,8 +517,16 @@ impl<'a> CabacDecoder<'a> {
     fn renorm_d(&mut self) -> CabacResult<()> {
         if self.cod_i_range < 256 {
             let shift = (self.cod_i_range as u32).leading_zeros() - 23;
-            self.cod_i_range <<= shift;
-            self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.u(shift)?;
+            if self.reader.bits_remaining() < shift as usize {
+                // Preserve bit-by-bit progress when EOF interrupts RenormD.
+                while self.cod_i_range < 256 {
+                    self.cod_i_range <<= 1;
+                    self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
+                }
+            } else {
+                self.cod_i_range <<= shift;
+                self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.u(shift)?;
+            }
         }
         Ok(())
     }
@@ -527,6 +535,26 @@ impl<'a> CabacDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_renorm_preserves_consumed_bits_and_arithmetic_state() {
+        let data = [0b0000_0011];
+        let mut reader = BitReader::new(&data);
+        reader.u(6).unwrap();
+        let mut decoder = CabacDecoder {
+            cod_i_range: 2,
+            cod_i_offset: 1,
+            reader,
+            bin_count: 7,
+        };
+        assert!(decoder.renorm_d().is_err());
+        // Two available bits are consumed; the third iteration doubles
+        // range before EOF, but does not assign its incomplete offset.
+        assert_eq!(decoder.position(), (1, 0));
+        assert_eq!(decoder.cod_i_range(), 16);
+        assert_eq!(decoder.cod_i_offset(), 7);
+        assert_eq!(decoder.bin_count(), 7);
+    }
 
     // -----------------------------------------------------------------
     // §9.3.1.1 — context variable initialisation. Tests hand-derive the

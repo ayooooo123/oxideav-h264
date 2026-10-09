@@ -326,7 +326,8 @@ a scope fence.
 
 ## License
 
-MIT — see `LICENSE` — except `src/recovery.rs`, a port of FFmpeg 2da55bf's
-choice of the pictures to output (h264_slice.c, h264_refs.c, h264dec.c),
-which is LGPL-2.1-or-later — see `LICENSE-LGPL`. The crate as a whole is
-`MIT AND LGPL-2.1-or-later`.
+MIT — see `LICENSE` — except the FFmpeg 2da55bf ports: `src/recovery.rs`
+(picture output selection from h264_slice.c, h264_refs.c and h264dec.c) and
+the attributed deblocking kernels in `src/reconstruct.rs` (h264_loopfilter.c
+and aarch64/h264dsp_neon.S). Those portions are LGPL-2.1-or-later — see
+`LICENSE-LGPL`. The crate as a whole is `MIT AND LGPL-2.1-or-later`.
