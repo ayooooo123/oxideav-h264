@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (PearTube fork)
 
+- MBAFF P/B reconstruction uses field picture-order counts for implicit
+  weighted prediction, shares the correct co-located-block mapping for
+  spatial and temporal direct prediction, and selects the correct
+  Intra_4x4 left-neighbour mode for Intra_8x8 frame macroblocks.
+
 - decoder: retire output IDs from every recovery collection (`delayed`,
   `flags`, `verdicts`) when an all-failed or incomplete picture is
   abandoned, or when a field pair supersedes an earlier field ID.
