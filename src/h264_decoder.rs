@@ -463,6 +463,9 @@ pub struct H264CodecDecoder {
     /// `bit_depth_chroma_minus8 + 8` — only populated when the avcC
     /// record carries the §5.2.4.1.1 High-profile extension.
     avcc_bit_depth_chroma: Option<u8>,
+
+    /// Parameter-set NAL units from avcC, replayed after a seek reset.
+    extradata_nals: Vec<Vec<u8>>,
 }
 
 impl H264CodecDecoder {
@@ -505,6 +508,7 @@ impl H264CodecDecoder {
             avcc_chroma_format: None,
             avcc_bit_depth_luma: None,
             avcc_bit_depth_chroma: None,
+            extradata_nals: Vec::new(),
         }
     }
 
@@ -553,6 +557,7 @@ impl H264CodecDecoder {
         if extra[0] != 1 {
             return Err(Error::invalid("h264: avcC configurationVersion must be 1"));
         }
+        self.extradata_nals.clear();
         let profile_idc = extra[1];
         // Capture, even though the driver picks them up again from the
         // SPS NAL — useful for diagnostics on streams where the avcC
@@ -585,6 +590,7 @@ impl H264CodecDecoder {
                 .driver
                 .process_nal(&extra[pos..pos + len])
                 .map_err(|e| Error::invalid(format!("h264 avcC SPS: {e}")))?;
+            self.extradata_nals.push(extra[pos..pos + len].to_vec());
             pos += len;
         }
         if pos >= extra.len() {
@@ -605,6 +611,7 @@ impl H264CodecDecoder {
                 .driver
                 .process_nal(&extra[pos..pos + len])
                 .map_err(|e| Error::invalid(format!("h264 avcC PPS: {e}")))?;
+            self.extradata_nals.push(extra[pos..pos + len].to_vec());
             pos += len;
         }
 
@@ -670,6 +677,7 @@ impl H264CodecDecoder {
                     .driver
                     .process_nal(&extra[pos..pos + len])
                     .map_err(|e| Error::invalid(format!("h264 avcC SPS-Ext: {e}")))?;
+                self.extradata_nals.push(extra[pos..pos + len].to_vec());
                 pos += len;
             }
         }
@@ -3177,6 +3185,10 @@ impl Decoder for H264CodecDecoder {
 
     fn reset(&mut self) -> Result<()> {
         self.driver = H264Driver::new();
+        // The out-of-band parameter sets stay in force across a seek.
+        for nal in &self.extradata_nals {
+            let _ = self.driver.process_nal(nal);
+        }
         self.last_slice = None;
         self.decode_errors = 0;
         self.eof = false;

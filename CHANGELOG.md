@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every slice refused); at its 4 s I frame no frame is output, as in
   FFmpeg (before: 93).
 
+- `reset()` (a seek) dropped the parameter sets of the `avcC` record, so
+  a stream without in-band SPS / PPS (the usual MP4 / Matroska case)
+  decoded nothing after a seek; they are now replayed into the reset
+  decoder.
+
 - decoder: apply FFmpeg 2da55bf's recovery gate to picture output
   (`src/recovery.rs`, LGPL port): a picture is recovered at an IDR, at
   the frame a recovery point SEI names, or at an unmarked random access
