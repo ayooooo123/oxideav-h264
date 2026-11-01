@@ -12533,9 +12533,6 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
                     height: rp.height_in_samples,
                 });
             }
-            if rp.non_existing {
-                return Err(ReconstructError::NonExistingRef);
-            }
             if (chroma_array_type == 1 || chroma_array_type == 2)
                 && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
             {
