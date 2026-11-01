@@ -47,8 +47,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use oxideav_core::Decoder;
+#[cfg(test)]
+use oxideav_core::PixelFormat;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame,
     VideoPlane,
 };
 
@@ -56,6 +58,7 @@ use crate::decoder::{Decoder as H264Driver, Event};
 use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::frame_thread::{Deferred, FtProvider, FtRef, FtSliceWork, Pool, SharedPlanes};
 use crate::mb_grid::MbGrid;
+use crate::out_shape::{OutShape, ShapeTraits};
 use crate::picture::Picture;
 use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
 use crate::recovery::{MarkedPicture, Recovery};
@@ -69,16 +72,14 @@ use crate::{reconstruct, slice_data};
 
 /// A decoded picture on its way to `receive_frame`: ready, or still
 /// being reconstructed on the frame-threading pool.
-enum OutFrame {
+enum OutPic {
     Ready(VideoFrame),
     Pending(Arc<SharedPlanes>),
 }
 
 struct OutputPicture {
-    frame: OutFrame,
-    width: u32,
-    height: u32,
-    format: Option<PixelFormat>,
+    frame: OutPic,
+    shape: OutShape,
     recovered: u8,
     /// The frame's id in [`Recovery::select_output`]; `None` for a frame
     /// FFmpeg's `delayed_pic` never held (a lone field).
@@ -247,8 +248,8 @@ struct PendingField {
     /// §7.4.2.1.1 — the frame cropping margins of the field's SPS,
     /// applied when the pair (or the lone field) is output.
     crop: FrameCropMargins,
-    /// Pixel layout of the field's samples (see [`OutputPicture::format`]).
-    format: Option<PixelFormat>,
+    /// Output metadata of the field's SPS, retained through pairing.
+    traits: ShapeTraits,
     /// `crate::recovery::RECOVERED_*` bits of the field; a pair's frame
     /// carries the union of its two fields'.
     recovered: u8,
@@ -277,10 +278,10 @@ struct PendingField {
 struct ScpState {
     subs: [Box<H264CodecDecoder>; 3],
     /// Per-plane decoded (monochrome) frames awaiting their two
-    /// siblings, with each frame's visible size. The three sub-decoders
-    /// run identical §8.2.1 / §C.4 machinery on identical slice-header
-    /// fields, so their output streams pair 1:1 in emission order.
-    queues: [VecDeque<(VideoFrame, Option<(u32, u32)>, Option<PixelFormat>)>; 3],
+    /// siblings. The three sub-decoders run identical §8.2.1 / §C.4
+    /// machinery on identical slice-header fields, so their output
+    /// streams pair 1:1 in emission order.
+    queues: [VecDeque<(VideoFrame, OutShape)>; 3],
 }
 
 impl ScpState {
@@ -410,10 +411,6 @@ pub struct H264CodecDecoder {
     /// Also used to carry the `flush()` drain at EOF. Only pictures the
     /// recovery gate ([`Self::release`]) passes get here.
     ready: VecDeque<OutputPicture>,
-    /// Visible size and pixel layout of the frame `receive_frame` last
-    /// returned, which `output_video_dimensions` / `output_pixel_format`
-    /// report until the next one.
-    returned: Option<(u32, u32, Option<PixelFormat>)>,
     /// Which pictures FFmpeg's decoder outputs (IDR, recovery point,
     /// unmarked random access point).
     recovery: Recovery,
@@ -527,6 +524,11 @@ pub struct H264CodecDecoder {
     /// the fresh NAL driver of a `reset` (a seek keeps the stream's
     /// out-of-band SPS / PPS).
     extradata_nals: Vec<Vec<u8>>,
+    /// The description of the frame `receive_frame` returned last.
+    emitted_shape: Option<OutShape>,
+    /// `Decoder::output_params_generation` — bumped when a returned
+    /// frame's description differs from the previous frame's.
+    params_generation: u64,
 }
 
 impl H264CodecDecoder {
@@ -544,7 +546,6 @@ impl H264CodecDecoder {
             eof: false,
             output_dpb: DpbOutput::<OutputPicture>::new(16, 16),
             ready: VecDeque::new(),
-            returned: None,
             recovery: Recovery::default(),
             last_geometry: None,
             pending_pts: None,
@@ -573,6 +574,8 @@ impl H264CodecDecoder {
             ft: None,
             pending_sd: None,
             extradata_nals: Vec::new(),
+            emitted_shape: None,
+            params_generation: 0,
         }
     }
 
@@ -854,12 +857,6 @@ impl H264CodecDecoder {
         }
     }
 
-    /// The SPS of the picture being decoded, else the one the last
-    /// slice activated: what `output_video_dimensions` and
-    /// `output_pixel_format` report before the first frame.
-    fn announced_sps(&self) -> Option<&Sps> {
-        self.in_progress.as_ref().map(|p| &p.sps).or_else(|| self.driver.active_sps())
-    }
 
     /// Handle a single emitted driver event.
     fn handle_event(&mut self, ev: Event) -> Result<()> {
@@ -1114,28 +1111,24 @@ impl H264CodecDecoder {
             return;
         };
         for (sub, queue) in scp.subs.iter_mut().zip(scp.queues.iter_mut()) {
-            while let Ok(Frame::Video(vf)) = sub.receive_frame() {
-                // The sub-decoder reports the frame it just returned.
-                queue.push_back((vf, sub.output_video_dimensions(), sub.output_pixel_format()));
+            while let Ok(shaped) = sub.receive_shaped() {
+                queue.push_back(shaped);
             }
         }
         while scp.queues.iter().all(|q| !q.is_empty()) {
-            let (y, size, format) = scp.queues[0].pop_front().expect("checked non-empty");
-            let (cb, _, _) = scp.queues[1].pop_front().expect("checked non-empty");
-            let (cr, _, _) = scp.queues[2].pop_front().expect("checked non-empty");
+            let (y, y_shape) = scp.queues[0].pop_front().expect("checked non-empty");
+            let (cb, _) = scp.queues[1].pop_front().expect("checked non-empty");
+            let (cr, _) = scp.queues[2].pop_front().expect("checked non-empty");
             let mut planes = y.planes;
             // Each sub-decoder emitted a single-plane monochrome frame
             // of identical geometry (all three planes share the SPS).
             planes.extend(cb.planes);
             planes.extend(cr.planes);
-            let (width, height) = size.unwrap_or_default();
             // The plane decoders already withheld what FFmpeg would not
             // output, so the merged frame goes straight out.
             self.ready.push_back(OutputPicture {
-                frame: OutFrame::Ready(VideoFrame { pts: y.pts, planes }),
-                width,
-                height,
-                format: separate_planes_format(format),
+                frame: OutPic::Ready(VideoFrame { pts: y.pts, planes }),
+                shape: y_shape.merged_planes(),
                 recovered: 0,
                 id: None,
             });
@@ -2597,7 +2590,7 @@ impl H264CodecDecoder {
         // (opposite parity) and the pair is re-interleaved into a single
         // full-height output frame whose POC is the minimum of the two
         // field POCs (§8.2.1 eq. 8-1).
-        let format = sps_pixel_format(&sps);
+        let traits = ShapeTraits::of_sps(&sps, self.scp_plane_mode);
         if first_header.field_pic_flag {
             self.handle_field_output(PendingField {
                 pic,
@@ -2606,7 +2599,7 @@ impl H264CodecDecoder {
                 field_poc: output_poc,
                 pts,
                 crop: sps.frame_crop_margins(),
-                format,
+                traits,
                 recovered,
                 frame_intra,
                 frame_b,
@@ -2617,18 +2610,16 @@ impl H264CodecDecoder {
         }
 
         let out = match (&ft_planes, early_vf.take()) {
-            (Some(planes), _) => OutFrame::Pending(planes.clone()),
-            (None, Some((vf, _, _))) => OutFrame::Ready(vf),
+            (Some(planes), _) => OutPic::Pending(planes.clone()),
+            (None, Some((vf, _, _))) => OutPic::Ready(vf),
             (None, None) => {
-                OutFrame::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()).0)
+                OutPic::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()).0)
             }
         };
         let entry = OutputEntry {
             picture: OutputPicture {
                 frame: out,
-                width: sps.cropped_dimensions().0,
-                height: sps.cropped_dimensions().1,
-                format,
+                shape: OutShape::of_sps(&sps, self.scp_plane_mode),
                 recovered,
                 id: output_id,
             },
@@ -2675,10 +2666,8 @@ impl H264CodecDecoder {
                 let (frame, width, height) = picture_to_video_frame(&frame, frame_pts, field.crop);
                 let entry = OutputEntry {
                     picture: OutputPicture {
-                        frame: OutFrame::Ready(frame),
-                        width,
-                        height,
-                        format: field.format,
+                        frame: OutPic::Ready(frame),
+                        shape: field.traits.shape(width, height, FrameCropMargins::default()),
                         // FFmpeg's flags belong to the frame both fields
                         // decode into.
                         recovered: prev.recovered | field.recovered,
@@ -2709,10 +2698,8 @@ impl H264CodecDecoder {
         let (frame, width, height) = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let entry = OutputEntry {
             picture: OutputPicture {
-                frame: OutFrame::Ready(frame),
-                width,
-                height,
-                format: field.format,
+                frame: OutPic::Ready(frame),
+                shape: field.traits.shape(width, height, FrameCropMargins::default()),
                 recovered: field.recovered,
                 id: field.output_id,
             },
@@ -3370,26 +3357,87 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        let (vf, shape) = self.receive_shaped()?;
+        // The description changes together with the first frame of a
+        // new shape (never at the header announcing it: pictures of
+        // the old shape may still have been queued for output).
+        if self.emitted_shape.is_some_and(|prev| prev != shape) {
+            self.params_generation = self.params_generation.wrapping_add(1);
+        }
+        self.emitted_shape = Some(shape);
+        Ok(Frame::Video(vf))
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self.emitted_shape.or_else(|| self.announced_shape())?;
+        Some(shape.to_params(&self.codec_id))
+    }
+
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.params_generation
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Frame threading — replay every held-back event first.
+        self.ft_pump(true);
+        self.flush_inner()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // Frame threading — drop held-back input, let in-flight
+        // pictures finish (nothing reads them any more).
+        if let Some(ft) = self.ft.as_mut() {
+            ft.queue.clear();
+            ft.queued_slices = 0;
+        }
+        self.pending_sd = None;
+        self.in_progress = None;
+        self.ft_shutdown();
+        self.reset_inner()
+    }
+}
+
+impl H264CodecDecoder {
+    /// The description of the output before the first frame: the
+    /// next picture already released for output, else the active SPS,
+    /// else the lowest-id SPS stored (an `avcC` record's, or one
+    /// received in band ahead of the first slice).
+    fn announced_shape(&self) -> Option<OutShape> {
+        if let Some(front) = self.ready.front() {
+            return Some(front.shape);
+        }
+        let sps = self
+            .driver
+            .active_sps()
+            .or_else(|| (0..32).find_map(|id| self.driver.sps(id)))?;
+        Some(OutShape::of_sps(sps, self.scp_plane_mode))
+    }
+
+    /// The next output frame (§C.4 order) with its description.
+    fn receive_shaped(&mut self) -> Result<(VideoFrame, OutShape)> {
         loop {
             // §C.4 — bumped / already-released pictures come out first
             // in the order the bumping process produced them. A picture
             // still being reconstructed on the pool holds the queue
             // until it is done (waited for at end of stream).
             if let Some(front) = self.ready.front() {
-                if let OutFrame::Pending(planes) = &front.frame {
+                if let OutPic::Pending(planes) = &front.frame {
                     if planes.is_done().is_none() && !self.eof {
                         return Err(Error::NeedMore);
                     }
                 }
                 let out = self.ready.pop_front().expect("front exists");
-                self.returned = Some((out.width, out.height, out.format));
                 let frame = match out.frame {
-                    OutFrame::Ready(vf) => Some(vf),
-                    OutFrame::Pending(planes) => {
+                    OutPic::Ready(vf) => Some(vf),
+                    OutPic::Pending(planes) => {
                         if planes.wait_done() { planes.take_output() } else { None }
                     }
                 };
-                return frame.map(Frame::Video).ok_or_else(|| Error::invalid(
+                return frame.map(|vf| (vf, out.shape)).ok_or_else(|| Error::invalid(
                     "h264: frame-threaded reconstruction of a picture failed"
                 ));
             }
@@ -3416,44 +3464,6 @@ impl Decoder for H264CodecDecoder {
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
-        // Frame threading — replay every held-back event first.
-        self.ft_pump(true);
-        self.flush_inner()
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        // Frame threading — drop held-back input, let in-flight
-        // pictures finish (nothing reads them any more).
-        if let Some(ft) = self.ft.as_mut() {
-            ft.queue.clear();
-            ft.queued_slices = 0;
-        }
-        self.pending_sd = None;
-        self.in_progress = None;
-        self.ft_shutdown();
-        self.reset_inner()
-    }
-    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
-        match self.returned {
-            Some((width, height, _)) => Some((width, height)).filter(|&(w, h)| w > 0 && h > 0),
-            None => self.announced_sps().map(Sps::cropped_dimensions).filter(|&(w, h)| w > 0 && h > 0),
-        }
-    }
-
-    fn output_pixel_format(&self) -> Option<PixelFormat> {
-        match self.returned {
-            Some((_, _, format)) => format,
-            None => self.announced_sps().and_then(|sps| {
-                let format = sps_pixel_format(sps);
-                if sps.separate_colour_plane_flag {
-                    separate_planes_format(format)
-                } else {
-                    format
-                }
-            }),
-        }
-    }
 }
 
 impl H264CodecDecoder {
@@ -3762,7 +3772,6 @@ impl H264CodecDecoder {
         // frame last returned no longer describes the output.
         self.recovery.seek();
         self.last_geometry = None;
-        self.returned = None;
         // §C.4 — wipe the output queue and any picture that was
         // already bumped but not yet consumed.
         self.output_dpb.reset();
@@ -3899,9 +3908,8 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 ///   per sample.
 ///
 /// The slim `VideoFrame` shape only carries `pts` + `planes`; the
-/// visible size this returns alongside the frame (and the pixel format
-/// [`sps_pixel_format`] derives) reach the caller through
-/// [`Decoder::output_video_dimensions`] / [`Decoder::output_pixel_format`].
+/// visible size this returns alongside the frame and its queued [`OutShape`]
+/// reach the caller together through [`Decoder::output_params`].
 fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargins) -> (VideoFrame, u32, u32) {
     let w = pic.width_in_samples as usize;
     let h = pic.height_in_samples as usize;
@@ -3983,56 +3991,6 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
     (VideoFrame { pts, planes }, out_w as u32, out_h as u32)
 }
 
-/// The [`PixelFormat`] of the frames a picture decoded with `sps`
-/// becomes (`picture_to_video_frame` layout): the luma plane alone for
-/// 4:0:0 (each colour plane of a separate-colour-plane stream decodes as
-/// one), 16-bit little-endian samples above 8 bits, and the full-range
-/// (`J`) variants FFmpeg's `get_pixel_format` picks for 8-bit video
-/// whose VUI signals `video_full_range_flag`. `None` for depths
-/// [`PixelFormat`] has no variant for and for luma and chroma depths
-/// that differ.
-fn sps_pixel_format(sps: &Sps) -> Option<PixelFormat> {
-    let depth = sps.bit_depth_luma_minus8 + 8;
-    let chroma = sps.chroma_array_type();
-    if chroma != 0 && sps.bit_depth_chroma_minus8 + 8 != depth {
-        return None;
-    }
-    let full_range = sps
-        .vui
-        .as_ref()
-        .and_then(|v| v.video_signal_type.as_ref())
-        .is_some_and(|s| s.video_full_range_flag);
-    use PixelFormat::*;
-    Some(match (chroma, depth) {
-        (0, 8) => Gray8,
-        (0, 10) => Gray10Le,
-        (0, 12) => Gray12Le,
-        (1, 8) if full_range => YuvJ420P,
-        (1, 8) => Yuv420P,
-        (2, 8) if full_range => YuvJ422P,
-        (2, 8) => Yuv422P,
-        (3, 8) if full_range => YuvJ444P,
-        (3, 8) => Yuv444P,
-        (1, 10) => Yuv420P10Le,
-        (2, 10) => Yuv422P10Le,
-        (3, 10) => Yuv444P10Le,
-        (1, 12) => Yuv420P12Le,
-        (2, 12) => Yuv422P12Le,
-        (3, 12) => Yuv444P12Le,
-        _ => return None,
-    })
-}
-
-/// The separate-colour-plane counterpart of [`sps_pixel_format`]: the 4:4:4
-/// format whose planes are three of the monochrome `plane` format.
-fn separate_planes_format(plane: Option<PixelFormat>) -> Option<PixelFormat> {
-    Some(match plane? {
-        PixelFormat::Gray8 => PixelFormat::Yuv444P,
-        PixelFormat::Gray10Le => PixelFormat::Yuv444P10Le,
-        PixelFormat::Gray12Le => PixelFormat::Yuv444P12Le,
-        _ => return None,
-    })
-}
 
 /// What FFmpeg's decoder reinitialises on when a new SPS changes it
 /// (h264_slice.c:1097-1108): the coded size in macroblocks, the chroma
@@ -4082,16 +4040,15 @@ mod tests {
     /// track individual pictures without carrying real pixel data.
     fn vf(tag: u8) -> OutputPicture {
         OutputPicture {
-            frame: OutFrame::Ready(VideoFrame {
+            frame: OutPic::Ready(VideoFrame {
                 pts: None,
                 planes: vec![VideoPlane {
                     stride: 1,
                     data: vec![tag],
                 }],
             }),
-            width: 1,
-            height: 1,
-            format: Some(PixelFormat::Gray8),
+            shape: ShapeTraits { pixel_format: Some(PixelFormat::Gray8), ..Default::default() }
+                .shape(1, 1, FrameCropMargins::default()),
             recovered: crate::recovery::RECOVERED_IDR,
             id: None,
         }
@@ -5359,7 +5316,7 @@ mod tests {
             field_poc,
             pts,
             crop,
-            format: Some(PixelFormat::Yuv420P),
+            traits: ShapeTraits { pixel_format: Some(PixelFormat::Yuv420P), ..Default::default() },
             recovered: crate::recovery::RECOVERED_IDR,
             frame_intra: true,
             frame_b: false,
