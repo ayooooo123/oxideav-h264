@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `reset()` preserves and replays avcC parameter sets after a seek.
 - Retain compatibility with the PearTube oxideav-core API rather than
   requiring upstream output-parameter events.
+- Materialize frame-threaded references before copying their samples into
+  concealed frame-number gaps; corrupted streams remain thread-invariant.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-h264/compare/v0.1.9...v0.1.10) - 2026-10-25
 ### Fixed (PearTube fork)
 

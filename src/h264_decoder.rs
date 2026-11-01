@@ -2833,6 +2833,8 @@ impl H264CodecDecoder {
         let gaps_allowed = sps.gaps_in_frame_num_value_allowed_flag;
         let first_field_waiting = self.pending_field.is_some();
         while frame_num != prev && !first_field_waiting && frame_num != (prev + 1) % max {
+            // A gap copies complete samples, not a frame-threaded shell.
+            self.ft_materialize();
             // FFmpeg's `short_ref[0]` before this gap frame joins.
             let newest = self.newest_short_term_frame(sps);
             if !gaps_allowed {
