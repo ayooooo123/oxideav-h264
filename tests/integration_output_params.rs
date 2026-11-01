@@ -100,11 +100,11 @@ fn probe(name: &str) -> Probe {
 fn ffprobe_pix_fmt(s: &str) -> (PixelFormat, bool) {
     match s {
         "yuv420p" => (PixelFormat::Yuv420P, false),
-        "yuvj420p" => (PixelFormat::Yuv420P, true),
+        "yuvj420p" => (PixelFormat::YuvJ420P, true),
         "yuv422p" => (PixelFormat::Yuv422P, false),
-        "yuvj422p" => (PixelFormat::Yuv422P, true),
+        "yuvj422p" => (PixelFormat::YuvJ422P, true),
         "yuv444p" => (PixelFormat::Yuv444P, false),
-        "yuvj444p" => (PixelFormat::Yuv444P, true),
+        "yuvj444p" => (PixelFormat::YuvJ444P, true),
         "yuv420p10le" => (PixelFormat::Yuv420P10Le, false),
         "yuv422p10le" => (PixelFormat::Yuv422P10Le, false),
         "yuv444p10le" => (PixelFormat::Yuv444P10Le, false),
@@ -167,9 +167,9 @@ fn plane_geometry(pf: PixelFormat, w: usize, h: usize) -> Vec<(usize, usize)> {
     let (bps, sub, planes) = match pf {
         Gray8 => (1, (1, 1), 1),
         Gray10Le | Gray12Le => (2, (1, 1), 1),
-        Yuv420P => (1, (2, 2), 3),
-        Yuv422P => (1, (2, 1), 3),
-        Yuv444P => (1, (1, 1), 3),
+        Yuv420P | YuvJ420P => (1, (2, 2), 3),
+        Yuv422P | YuvJ422P => (1, (2, 1), 3),
+        Yuv444P | YuvJ444P => (1, (1, 1), 3),
         Yuv420P10Le | Yuv420P12Le => (2, (2, 2), 3),
         Yuv422P10Le | Yuv422P12Le => (2, (2, 1), 3),
         Yuv444P10Le | Yuv444P12Le => (2, (1, 1), 3),

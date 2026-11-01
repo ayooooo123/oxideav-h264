@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth and the worker budget do not move the switch point). Verified
   against ffprobe on black-box libx264 fixtures
   (`tests/fixtures/output_params/`, `gen.sh`).
+- Reconciled with PearTube's recovered/open-GOP output gate, PAFF pairing,
+  cropped emitted dimensions and full-range `YuvJ*` labels. Shape metadata
+  follows only pictures that pass recovery; parsing a newer SPS cannot
+  relabel pictures still waiting in output order.
 
 ### Fixed
 
