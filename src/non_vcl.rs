@@ -64,6 +64,7 @@ pub struct SeiMessage {
 /// ff_byte-run for payload_size, last_payload_size_byte, then
 /// `payload_size` bytes of payload, ending when more_rbsp_data()
 /// returns false.
+#[cold]
 pub fn parse_sei_rbsp(rbsp: &[u8]) -> Result<Vec<SeiMessage>, NonVclError> {
     let mut r = BitReader::new(rbsp);
     let mut messages = Vec::new();

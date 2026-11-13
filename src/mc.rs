@@ -92,7 +92,7 @@ impl<'a> PlaneSrc<'a> {
 /// Gather the `ww`x`wh` window whose top-left integer sample is
 /// `(x0, y0)` into `out` (row stride `ostride`), clamping every
 /// coordinate into the plane (eqs. 8-239 / 8-240, 8-262..8-269).
-#[inline]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn gather(
     src: &PlaneSrc<'_>,
@@ -161,6 +161,7 @@ fn clip1(v: i32, max_v: i32) -> i32 {
 /// integer position `(int_x, int_y)` with quarter-sample offset
 /// `(x_frac, y_frac)` (each 0..=3), writing `dst[y * dst_stride + x]`.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(crate) fn luma(
     src: &PlaneSrc<'_>,
     int_x: i32,
@@ -174,6 +175,57 @@ pub(crate) fn luma(
     dst_stride: usize,
 ) {
     debug_assert!(w <= 16 && h <= 16 && x_frac < 4 && y_frac < 4);
+    if let PlaneSrc::Flat {
+        data,
+        stride,
+        width,
+        height,
+    } = *src
+    {
+        let bit_depth = (max_v as u32 + 1).trailing_zeros();
+        if matches!(bit_depth, 8..=14)
+            && crate::simd::chunked::interpolate_luma(
+                data, stride, width, height, int_x, int_y, x_frac, y_frac, w as u32, h as u32,
+                bit_depth, dst, dst_stride,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    } else if let PlaneSrc::Banded {
+        bands,
+        band_rows,
+        width,
+        height,
+    } = *src
+    {
+        let y_min = if x_frac == 0 && y_frac == 0 { int_y } else { int_y - 2 };
+        let y_max = if x_frac == 0 && y_frac == 0 {
+            int_y + h as i32 - 1
+        } else {
+            int_y + h as i32 + 2
+        };
+        if y_min >= 0 && (y_max as usize) < height {
+            let b0 = (y_min as usize) / band_rows;
+            let b1 = (y_max as usize) / band_rows;
+            let bit_depth = (max_v as u32 + 1).trailing_zeros();
+            if b0 == b1
+                && matches!(bit_depth, 8..=14)
+                && let Some(band) = bands[b0].get()
+            {
+                let band_h = band.len() / width;
+                let local_y = int_y - (b0 * band_rows) as i32;
+                if crate::simd::chunked::interpolate_luma(
+                    band, width, width, band_h, int_x, local_y, x_frac, y_frac, w as u32, h as u32,
+                    bit_depth, dst, dst_stride,
+                )
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+    }
     if x_frac == 0 && y_frac == 0 {
         // Table 8-12 — G: the integer samples themselves.
         gather(src, int_x, int_y, w, h, dst, dst_stride);
@@ -314,6 +366,50 @@ pub(crate) fn chroma(
     dst_stride: usize,
 ) {
     debug_assert!(w <= 16 && h <= 16 && x_frac < 8 && y_frac < 8);
+    if let PlaneSrc::Flat {
+        data,
+        stride,
+        width,
+        height,
+    } = *src
+    {
+        if crate::simd::chunked::interpolate_chroma(
+            data, stride, width, height, int_x, int_y, x_frac, y_frac, w as u32, h as u32, 8, dst,
+            dst_stride,
+        )
+        .is_ok()
+        {
+            return;
+        }
+    } else if let PlaneSrc::Banded {
+        bands,
+        band_rows,
+        width,
+        height,
+    } = *src
+    {
+        let y_max = if x_frac == 0 && y_frac == 0 {
+            int_y + h as i32 - 1
+        } else {
+            int_y + h as i32
+        };
+        if int_y >= 0 && (y_max as usize) < height {
+            let b0 = (int_y as usize) / band_rows;
+            let b1 = (y_max as usize) / band_rows;
+            if b0 == b1 && let Some(band) = bands[b0].get() {
+                let band_h = band.len() / width;
+                let local_y = int_y - (b0 * band_rows) as i32;
+                if crate::simd::chunked::interpolate_chroma(
+                    band, width, width, band_h, int_x, local_y, x_frac, y_frac, w as u32, h as u32,
+                    8, dst, dst_stride,
+                )
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+    }
     if x_frac == 0 && y_frac == 0 {
         gather(src, int_x, int_y, w, h, dst, dst_stride);
         return;

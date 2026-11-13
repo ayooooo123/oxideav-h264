@@ -396,11 +396,11 @@ pub fn select_scaling_list_4x4(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 1
     if list_idx >= 6 {
         return FLAT_4X4_16;
     }
-    // PPS override: when pic_scaling_matrix_present_flag == 1 the
-    // picture-level list is derived from the PPS per-index entries
-    // with the appropriate fall-back rule set.
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
+    if !pic_present && !sps.seq_scaling_matrix_present_flag {
+        return FLAT_4X4_16;
+    }
     // §8.5.9 — the derived list is in bitstream scan order; weightScale
     // is its §8.5.6 inverse scan (row-major). Flat lists are invariant.
     let scan_list = if !pic_present {
@@ -427,7 +427,9 @@ pub fn select_scaling_list_8x8(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 6
     }
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
-    // §8.5.9 — inverse-scan the derived scan-order list into the
+    if !pic_present && !sps.seq_scaling_matrix_present_flag {
+        return FLAT_8X8_16;
+    }
     // row-major weightScale8x8 every consumer indexes.
     let scan_list = if !pic_present {
         derive_sps_8x8(list_idx, sps)
@@ -866,40 +868,76 @@ pub fn inverse_transform_4x4_dc_preserved(
 // ---------------------------------------------------------------------------
 
 /// §8.5.13.1 — scaling for 8x8 residual blocks (eqs. 8-356, 8-357).
-fn scale_8x8(coeffs: &[i32; 64], qp: i32, scaling_list: &[i32; 64]) -> [i32; 64] {
+fn scale_8x8_single(c: i32, qp: i32, scaling_list: &[i32; 64], i: usize, j: usize) -> i32 {
+    if c == 0 {
+        return 0;
+    }
+    let qp_div = qp / 6;
+    let qp_mod = (qp % 6) as usize;
+    let ls = level_scale_8x8(scaling_list, qp_mod, i, j);
+    if qp >= 36 {
+        let shift = (qp_div - 6) as u32 & 31;
+        c.wrapping_mul(ls).wrapping_shl(shift)
+    } else {
+        let shift = (6 - qp_div) as u32;
+        let round = 1i32.wrapping_shl(5 - qp_div as u32);
+        (c.wrapping_mul(ls).wrapping_add(round)) >> shift
+    }
+}
+
+fn scale_8x8(coeffs: &[i32; 64], qp: i32, scaling_list: &[i32; 64]) -> ([i32; 64], u8) {
     let qp_div = qp / 6;
     let qp_mod = (qp % 6) as usize;
     let mut d = [0i32; 64];
-    for i in 0..8 {
-        for j in 0..8 {
-            let idx = i * 8 + j;
-            let ls = level_scale_8x8(scaling_list, qp_mod, i, j);
-            let c = coeffs[idx];
-            // Wrapping arithmetic — see §8.5.12 4×4 path for rationale.
-            d[idx] = if qp >= 36 {
-                // Eq. 8-356.
-                let shift = (qp_div - 6) as u32 & 31;
-                c.wrapping_mul(ls).wrapping_shl(shift)
-            } else {
-                // Eq. 8-357.
-                let shift = (6 - qp_div) as u32;
-                let round = 1i32.wrapping_shl(5 - qp_div as u32);
-                (c.wrapping_mul(ls).wrapping_add(round)) >> shift
-            };
+    let mut row_mask = 0u8;
+    if qp >= 36 {
+        let shift = (qp_div - 6) as u32 & 31;
+        for i in 0..8 {
+            let mut nz = false;
+            for j in 0..8 {
+                let idx = i * 8 + j;
+                let c = coeffs[idx];
+                if c != 0 {
+                    let ls = level_scale_8x8(scaling_list, qp_mod, i, j);
+                    let v = c.wrapping_mul(ls).wrapping_shl(shift);
+                    d[idx] = v;
+                    nz |= v != 0;
+                }
+            }
+            if nz {
+                row_mask |= 1 << i;
+            }
+        }
+    } else {
+        let shift = (6 - qp_div) as u32;
+        let round = 1i32.wrapping_shl(5 - qp_div as u32);
+        for i in 0..8 {
+            let mut nz = false;
+            for j in 0..8 {
+                let idx = i * 8 + j;
+                let c = coeffs[idx];
+                if c != 0 {
+                    let ls = level_scale_8x8(scaling_list, qp_mod, i, j);
+                    let v = (c.wrapping_mul(ls).wrapping_add(round)) >> shift;
+                    d[idx] = v;
+                    nz |= v != 0;
+                }
+            }
+            if nz {
+                row_mask |= 1 << i;
+            }
         }
     }
-    d
+    (d, row_mask)
 }
 
 /// §8.5.13.2 — 8x8 inverse transform core (eqs. 8-358..8-406).
-fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
-    // Row (horizontal) transform.
-    //
-    // For each row i: produce g_i[0..8] by sequentially computing
-    // e_i[0..8] (eqs. 8-358..8-365), f_i[0..8] (eqs. 8-366..8-373),
-    // and g_i[0..8] (eqs. 8-374..8-381).
+fn inverse_core_8x8(d: &[i32; 64], row_mask: u8) -> [i32; 64] {
     let mut g = [0i32; 64];
     for i in 0..8 {
+        if (row_mask >> i) & 1 == 0 {
+            continue;
+        }
         let base = i * 8;
         let d0 = d[base];
         let d1 = d[base + 1];
@@ -910,7 +948,6 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         let d6 = d[base + 6];
         let d7 = d[base + 7];
 
-        // eqs. 8-358..8-365.
         let e0 = d0 + d4;
         let e1 = -d3 + d5 - d7 - (d7 >> 1);
         let e2 = d0 - d4;
@@ -920,7 +957,6 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         let e6 = d2 + (d6 >> 1);
         let e7 = d3 + d5 + d1 + (d1 >> 1);
 
-        // eqs. 8-366..8-373.
         let f0 = e0 + e6;
         let f1 = e1 + (e7 >> 2);
         let f2 = e2 + e4;
@@ -930,7 +966,6 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         let f6 = e0 - e6;
         let f7 = e7 - (e1 >> 2);
 
-        // eqs. 8-374..8-381.
         g[base] = f0 + f7;
         g[base + 1] = f2 + f5;
         g[base + 2] = f4 + f3;
@@ -940,7 +975,6 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         g[base + 6] = f2 - f5;
         g[base + 7] = f0 - f7;
     }
-
     // Column (vertical) transform.
     //
     // Same 1-D inverse applied to each column. Produces m_ij, eqs.
@@ -1004,13 +1038,15 @@ pub fn inverse_transform_8x8(
 ) -> Result<[i32; 64], TransformError> {
     check_qp(qp, bit_depth)?;
     check_bit_depth(bit_depth)?;
-    let d = scale_8x8(coeffs, qp, scaling_list);
-    // An all-zero block transforms to zero (eqs. 8-358..8-406 are linear
-    // and the final rounding of zero is zero).
-    if d.iter().all(|&v| v == 0) {
+    if coeffs[1..].iter().all(|&v| v == 0) {
+        let d0 = scale_8x8_single(coeffs[0], qp, scaling_list, 0, 0);
+        return Ok([(d0 + 32) >> 6; 64]);
+    }
+    let (d, row_mask) = scale_8x8(coeffs, qp, scaling_list);
+    if row_mask == 0 {
         return Ok([0; 64]);
     }
-    Ok(inverse_core_8x8(&d))
+    Ok(inverse_core_8x8(&d, row_mask))
 }
 
 // ---------------------------------------------------------------------------

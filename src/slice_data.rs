@@ -201,26 +201,40 @@ pub fn parse_slice_data_partitioned(
 
 // The trace switches are read once and cached: these checks run per
 // macroblock, and a `getenv()` per call shows up in decode profiles.
-fn env_flag(cache: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
-    *cache.get_or_init(|| std::env::var_os(name).is_some())
-}
-
-#[inline]
+#[inline(always)]
 fn ctx17_trace_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    env_flag(&CACHED, "OXIDEAV_H264_CTX17_TRACE")
+    #[cfg(debug_assertions)]
+    {
+        static CACHED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-#[inline]
+#[inline(always)]
 fn bin_trace_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    env_flag(&CACHED, "OXIDEAV_H264_BIN_TRACE")
+    #[cfg(debug_assertions)]
+    {
+        static CACHED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-#[inline]
+#[inline(always)]
 fn skip_trace_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    env_flag(&CACHED, "OXIDEAV_H264_SKIP_TRACE")
+    #[cfg(debug_assertions)]
+    {
+        static CACHED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -258,8 +272,7 @@ fn parse_slice_data_impl(
         return Err(SliceDataError::SliceQpOutOfRange(slice_qp_y));
     }
 
-    let mut macroblocks: Vec<Macroblock> = Vec::new();
-    let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
+    // Pre-sized below once PicSizeInMbs is computed.
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
     // §8.2.2 / §7.3.4 — FMO slice group map (round-453): NextMbAddress
     // walks the current slice group instead of the raster successor.
@@ -282,7 +295,13 @@ fn parse_slice_data_impl(
     // so the product fits in u32 by construction. Used downstream to
     // bound `mb_skip_run` and to detect MB-address overflow.
     let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
-    let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
+    let init_cap = if slice_header.first_mb_in_slice == 0 && pps.num_slice_groups_minus1 == 0 {
+        (pic_size_in_mbs as usize).saturating_mul(1 + usize::from(mbaff_frame_flag)).min(32_768)
+    } else {
+        (pic_size_in_mbs.saturating_sub(slice_header.first_mb_in_slice) as usize).clamp(64, 4096)
+    };
+    let mut macroblocks: Vec<Macroblock> = Vec::with_capacity(init_cap);
+    let mut mb_field_decoding_flags: Vec<bool> = Vec::with_capacity(init_cap);
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
@@ -435,15 +454,6 @@ fn parse_slice_data_impl(
                     mb_field_decoding_flags.push(flag);
                     // §9.2.1.1 step 6 — a P_Skip / B_Skip neighbour
                     // contributes nN = 0. Mark available + is_skip.
-                    if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
-                        slot.is_available = true;
-                        slot.is_skip = true;
-                        slot.is_intra = false;
-                        slot.is_i_pcm = false;
-                        slot.luma_total_coeff = [0; 16];
-                        slot.cb_total_coeff = [0; 8];
-                        slot.cr_total_coeff = [0; 8];
-                    }
                     // §9.3.3.1.1.1 — mirror the availability / skip flag
                     // into the CABAC neighbour grid so subsequent MBs see
                     // the correct condTermFlag for mb_skip_flag and
@@ -623,7 +633,7 @@ fn parse_slice_data_impl(
                     prev_mb_qp_delta_nonzero: prev_mb_qp_delta_nonzero_slice,
                     chroma_array_type,
                     transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
-                    cavlc_nc: Some(&mut cavlc_nc),
+                    cavlc_nc: None,
                     current_mb_addr: curr_mb_addr,
                     constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
                     num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
@@ -862,6 +872,7 @@ fn parse_slice_data_impl(
         // ---------------------------------------------------------
         // CAVLC path (§7.3.4).
         // ---------------------------------------------------------
+        let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
         // §7.3.2.9 — position the partition-B / partition-C residual
         // readers (data-partitioned slices only).
         let mut dp_readers: Option<DpResidualReaders<'_>> = if part_b.is_some() || part_c.is_some()

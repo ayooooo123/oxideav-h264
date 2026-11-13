@@ -127,6 +127,7 @@ impl VuiParameters {
     /// §E.1.1 — parse a `vui_parameters()` structure from the current
     /// cursor position. Does NOT consume rbsp_trailing_bits — the
     /// caller (SPS parser) handles that.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, VuiError> {
         let mut out = VuiParameters::default();
 
@@ -241,6 +242,7 @@ impl VuiParameters {
 impl HrdParameters {
     /// §E.1.2 — parse an `hrd_parameters()` structure from the current
     /// cursor position.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, VuiError> {
         // §E.1.2 cpb_cnt_minus1 ue(v). §E.2.2 restricts range to 0..=31.
         let cpb_cnt_minus1 = r.ue()?;

@@ -90,6 +90,27 @@ impl<'a> BitReader<'a> {
         self.bit_pos == 0
     }
 
+    /// Fast 1..=8 bit MSB-first read for CABAC renorm and bypass bins.
+    #[inline(always)]
+    pub(crate) fn short(&mut self, bits: u32) -> BitResult<u32> {
+        debug_assert!((1..=8).contains(&bits));
+        if let Some(&[b0, b1]) = self.data.get(self.byte_pos..self.byte_pos + 2) {
+            let pair = (u32::from(b0) << 8) | u32::from(b1);
+            let pos = u32::from(self.bit_pos) + bits;
+            let val = (pair >> (16 - pos)) & ((1u32 << bits) - 1);
+            self.byte_pos += (pos >> 3) as usize;
+            self.bit_pos = (pos & 7) as u8;
+            return Ok(val);
+        }
+        self.short_slow(bits)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn short_slow(&mut self, bits: u32) -> BitResult<u32> {
+        self.u(bits)
+    }
+
     /// §7.2 `u(n)`. `n` must be ≤ 32.
     pub fn u(&mut self, bits: u32) -> BitResult<u32> {
         if bits > 32 {

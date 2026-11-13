@@ -298,6 +298,7 @@ impl SpsMvcExtension {
     /// `profile_idc` selects the trailing MFC block (134 only) and
     /// `frame_mbs_only_flag` gates `rpu_field_processing_flag` inside
     /// it.
+    #[cold]
     pub fn parse(
         r: &mut BitReader<'_>,
         profile_idc: u8,
@@ -530,6 +531,7 @@ pub struct MvcVuiParametersExtension {
 
 impl MvcVuiParametersExtension {
     /// §G.14.1 — parse from the current cursor position.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
         // §G.14.2 — vui_mvc_num_ops_minus1 in 0..=1023; checked before
         // allocation.
@@ -699,6 +701,7 @@ impl SpsMvcdExtension {
     }
 
     /// §H.7.3.2.1.4 — parse from the current cursor position.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
         // §G.7.4.2.1.4 (by reference from §H.7.4.2.1.4) —
         // num_views_minus1 in 0..=1023; checked before any allocation.
@@ -880,6 +883,7 @@ pub struct MvcdVuiParametersExtension {
 
 impl MvcdVuiParametersExtension {
     /// §H.14.1 — parse from the current cursor position.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
         // §H.14.2 — vui_mvcd_num_ops_minus1 in 0..=1023; checked before
         // allocation.
@@ -1019,6 +1023,7 @@ impl SpsSvcExtension {
     /// reference-layer-chroma-phase reads. `frame_mbs_only_flag` is
     /// carried in the returned offsets' implicit units but is not needed
     /// for parsing (the `se(v)` reads are unit-agnostic).
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>, chroma_array_type: u32) -> Result<Self, SubsetSpsError> {
         let inter_layer_deblocking_filter_control_present_flag = r.u(1)? == 1;
         let extended_spatial_scalability_idc = r.u(2)?;
@@ -1136,6 +1141,7 @@ pub struct SvcVuiParametersExtension {
 
 impl SvcVuiParametersExtension {
     /// §F.14.1 — parse from the current cursor position.
+    #[cold]
     pub fn parse(r: &mut BitReader<'_>) -> Result<Self, SubsetSpsError> {
         // §F.14.2 — vui_ext_num_entries_minus1 in 0..=1023; checked
         // before allocation.
@@ -1256,6 +1262,7 @@ impl SubsetSps {
     /// slice that holds the RBSP body (NAL header byte stripped,
     /// emulation prevention bytes removed — normally obtained from
     /// [`crate::nal::parse_nal_unit`] on a NAL unit of type 15).
+    #[cold]
     pub fn parse(rbsp: &[u8]) -> Result<Self, SubsetSpsError> {
         let mut r = BitReader::new(rbsp);
         let sps = Sps::parse_seq_parameter_set_data(&mut r)?;

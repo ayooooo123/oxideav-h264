@@ -114,6 +114,7 @@ pub struct SeqParameterSetExtension {
 impl SeqParameterSetExtension {
     /// Parse a `seq_parameter_set_extension_rbsp()` from a de-emulated RBSP
     /// body (NAL header byte already removed).
+    #[cold]
     pub fn parse(rbsp: &[u8]) -> SpsExtensionResult<Self> {
         let mut r = BitReader::new(rbsp);
         Self::parse_from(&mut r)
@@ -121,6 +122,7 @@ impl SeqParameterSetExtension {
 
     /// Parse the body from an existing [`BitReader`] positioned at the first
     /// bit of `seq_parameter_set_id`.
+    #[cold]
     pub fn parse_from(r: &mut BitReader<'_>) -> SpsExtensionResult<Self> {
         let seq_parameter_set_id = r.ue()?;
         if seq_parameter_set_id > 31 {

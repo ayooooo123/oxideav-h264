@@ -1346,35 +1346,56 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
 /// Cached `OXIDEAV_H264_NO_DEBLOCK` env var lookup. Reading the env var
 /// per slice would dominate the decode wall-time on real content, since
 /// the OS resolves env vars through a `getenv()` syscall.
+#[inline(always)]
 fn deblock_no_op_cached() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var("OXIDEAV_H264_NO_DEBLOCK").is_ok());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-/// Cached `OXIDEAV_H264_RECON_DEBUG` flag (per-MB reconstruct trace).
+#[inline(always)]
 fn recon_debug_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var("OXIDEAV_H264_RECON_DEBUG").is_ok());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-/// Cached `OXIDEAV_H264_RECON_DEBUG_MB` (specific MB-address trace).
+#[inline(always)]
 fn recon_debug_mb_target() -> Option<u32> {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-    })
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<Option<u32>> = LazyLock::new(|| {
+            std::env::var("OXIDEAV_H264_RECON_DEBUG_MB")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        });
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    None
 }
 
-/// Cached `OXIDEAV_H264_DEBLOCK_TRACE` flag.
+#[inline(always)]
 fn deblock_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("OXIDEAV_H264_DEBLOCK_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 /// §8.5.8 eq. 8-309 (T-REC-H.264-202408) — derive the current MB's QP_Y
@@ -4876,8 +4897,11 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     let mut pred_luma = [0i32; 256];
     // Chroma prediction samples: sized per chroma MB dims.
     let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
-    let mut pred_cb = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
-    let mut pred_cr = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
+    let mut pred_cb_store = [0i32; 256];
+    let mut pred_cr_store = [0i32; 256];
+    let n_pred_c = (mbw_c as usize) * (mbh_c as usize);
+    let pred_cb_slice = &mut pred_cb_store[..n_pred_c];
+    let pred_cr_slice = &mut pred_cr_store[..n_pred_c];
 
     // §6.4.8 — stamp the current MB's slice identity eagerly so that
     // later partitions' MVpred neighbour lookups (within the same MB)
@@ -4902,24 +4926,50 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     // §8.4.1 for every partition first (a partition's motion depends
     // only on the motion of earlier ones), then §8.4.2 over the
     // coalesced partitions.
-    let mut derived = Vec::with_capacity(partitions.len());
-    for part in &partitions {
-        let (mv_l0, mv_l1) = derive_and_store_partition(
-            part,
-            mb_addr,
-            slice_header,
-            ref_pics,
-            grid,
-            inter_debug,
-            current_slice_id,
-            field_parity,
-        );
-        derived.push((*part, mv_l0, mv_l1));
-    }
-    let merged = (!derived.is_empty()).then(|| coalesce_partitions(&derived));
+    let mut derived_stack = [core::mem::MaybeUninit::<(InterPartition, Mv, Mv)>::uninit(); 16];
+    let mut derived_vec = Vec::new();
+    let derived: &[(InterPartition, Mv, Mv)] = if partitions.len() <= 16 {
+        for (slot, part) in derived_stack.iter_mut().zip(partitions.iter()) {
+            let (mv_l0, mv_l1) = derive_and_store_partition(
+                part,
+                mb_addr,
+                slice_header,
+                ref_pics,
+                grid,
+                inter_debug,
+                current_slice_id,
+                field_parity,
+            );
+            slot.write((*part, mv_l0, mv_l1));
+        }
+        // SAFETY: the first `partitions.len()` slots were initialized above.
+        unsafe {
+            core::slice::from_raw_parts(
+                derived_stack.as_ptr().cast::<(InterPartition, Mv, Mv)>(),
+                partitions.len(),
+            )
+        }
+    } else {
+        derived_vec.reserve(partitions.len());
+        for part in &partitions {
+            let (mv_l0, mv_l1) = derive_and_store_partition(
+                part,
+                mb_addr,
+                slice_header,
+                ref_pics,
+                grid,
+                inter_debug,
+                current_slice_id,
+                field_parity,
+            );
+            derived_vec.push((*part, mv_l0, mv_l1));
+        }
+        &derived_vec[..]
+    };
+    let merged = (!derived.is_empty()).then(|| coalesce_partitions(derived));
     let to_predict = match &merged {
         Some((m, n)) => &m[..*n],
-        None => &derived[..],
+        None => derived,
     };
     for (part, mv_l0, mv_l1) in to_predict {
         predict_partition(
@@ -4937,8 +4987,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             pic.pic_order_cnt,
             (pic.top_field_order_cnt, pic.bottom_field_order_cnt),
             &mut pred_luma,
-            &mut pred_cb,
-            &mut pred_cr,
+            pred_cb_slice,
+            pred_cr_slice,
             inter_debug,
             field_parity,
         )?;
@@ -4961,8 +5011,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             sps,
             pps,
             &pred_luma,
-            &pred_cb,
-            &pred_cr,
+            pred_cb_slice,
+            pred_cr_slice,
             &writer,
             pic,
             (mbaff_frame_flag && mb_field_decoding_flag) || slice_header.field_pic_flag,
@@ -4982,8 +5032,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         pps,
         &writer,
         &pred_luma,
-        &pred_cb,
-        &pred_cr,
+        pred_cb_slice,
+        pred_cr_slice,
         pic,
         mbaff_frame_flag && mb_field_decoding_flag,
         inter_debug,
@@ -5025,28 +5075,20 @@ fn inter_residual_write(
     // §8.5.9 — inter luma lists: 4x4 index iYCbCr + 3, 8x8 index
     // 2 * iYCbCr + 1, with iYCbCr = colour_plane_id when
     // separate_colour_plane_flag == 1 and 0 otherwise.
-    let luma_plane = luma_scaling_plane(sps, slice_header);
-    let sl4 = select_scaling_list_4x4(luma_plane + 3, sps, pps);
-    let sl8 = select_scaling_list_8x8(2 * luma_plane + 1, sps, pps);
-    // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
-    // §7.4.2.1.1 — lossless bypass: §8.5.12/§8.5.13 are the identity
-    // (eqs. 8-334 / 8-355). No §8.5.15 DPCM for inter macroblocks —
-    // it applies only to Intra_4x4/8x8/16x16 prediction modes.
     let bypass = transform_bypass_active(sps, qp_prime_y);
-    // §8.5.6/§8.5.7 — field inverse scans for FIELD-coded MBs.
     let field_scan = mbaff_field_mb || slice_header.field_pic_flag;
-
-    // The reconstructed macroblock: prediction plus residual, clipped
-    // (eq. 8-x Clip1Y of the §8.5.14 picture construction).
-    let mut out = *pred_luma;
-    // Every §8.5.12 / §8.5.13 transform call validates qP'Y / the bit
-    // depth first, whether or not the block carries coefficients.
     if !bypass {
         crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
     }
-    if mb.transform_size_8x8_flag {
+    if cbp_luma == 0 {
+        writer.write_luma_mb(pic, pred_luma);
+    } else {
+        let luma_plane = luma_scaling_plane(sps, slice_header);
+        let mut out = *pred_luma;
+        if mb.transform_size_8x8_flag {
+            let sl8 = select_scaling_list_8x8(2 * luma_plane + 1, sps, pps);
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
         // Each 8x8 is flagged by one bit of cbp_luma. The four 16-
         // entry arrays in residual_luma[blk8*4..blk8*4+4] concatenate
@@ -5060,9 +5102,6 @@ fn inter_residual_write(
                 continue;
             }
             let (bx, by) = LUMA_8X8_XY[blk8];
-            // `residual_luma` is compacted by the parser — quadrants
-            // with cbp_luma bit cleared are skipped, so index by
-            // set-bits-below-blk8 (see Intra_NxN path).
             let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
             let base_slot = set_before * 4;
             let mut scan = [0i32; 64];
@@ -5078,7 +5117,6 @@ fn inter_residual_write(
             }
             let coeffs = inv_scan_8x8(&scan, field_scan);
             let residual = if bypass {
-                // §8.5.13 eq. 8-355 — r = c.
                 coeffs
             } else {
                 inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?
@@ -5090,49 +5128,45 @@ fn inter_residual_write(
                 }
             }
         }
-    } else {
-        // §8.5.12 — 4x4 inter residual path.
-        #[allow(clippy::needless_range_loop)] // spec §8.5.12 raster-Z 4x4 walk
-        for blk4 in 0..16usize {
-            let blk8 = blk4 / 4;
-            if (cbp_luma >> blk8) & 1 == 0 {
-                continue;
-            }
-            // Compact index into `residual_luma` — the parser pushes 4
-            // entries per cbp_luma bit that is set in low-bit-first
-            // order, so the array index is (number of set bits below
-            // blk8) * 4 + (blk4 % 4), not blk4.
-            let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
-            let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
-                continue;
-            };
-            if coeffs_scan.iter().all(|&v| v == 0) {
-                continue;
-            }
-            let (bx, by) = LUMA_4X4_XY[blk4];
-            let coeffs = inv_scan_4x4(coeffs_scan, field_scan);
-            let residual = if bypass {
-                // §8.5.12 eq. 8-334 — r = c.
-                coeffs
-            } else {
-                inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
-            };
-            if inter_debug {
-                eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
-            }
-            for y in 0..4 {
-                let o = (by as usize + y) * 16 + bx as usize;
-                for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[y * 4..y * 4 + 4]) {
-                    *d += r;
+        } else {
+            let sl4 = select_scaling_list_4x4(luma_plane + 3, sps, pps);
+            #[allow(clippy::needless_range_loop)]
+            for blk4 in 0..16usize {
+                let blk8 = blk4 / 4;
+                if (cbp_luma >> blk8) & 1 == 0 {
+                    continue;
+                }
+                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+                let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
+                    continue;
+                };
+                if coeffs_scan.iter().all(|&v| v == 0) {
+                    continue;
+                }
+                let (bx, by) = LUMA_4X4_XY[blk4];
+                let coeffs = inv_scan_4x4(coeffs_scan, field_scan);
+                let residual = if bypass {
+                    coeffs
+                } else {
+                    inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
+                };
+                if inter_debug {
+                    eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
+                }
+                for y in 0..4 {
+                    let o = (by as usize + y) * 16 + bx as usize;
+                    for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[y * 4..y * 4 + 4]) {
+                        *d += r;
+                    }
                 }
             }
         }
+        let max_y = (1i32 << bit_depth_y) - 1;
+        for v in out.iter_mut() {
+            *v = (*v).clamp(0, max_y);
+        }
+        writer.write_luma_mb(pic, &out);
     }
-    let max_y = (1i32 << bit_depth_y) - 1;
-    for v in out.iter_mut() {
-        *v = (*v).clamp(0, max_y);
-    }
-    writer.write_luma_mb(pic, &out);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {
@@ -5653,6 +5687,7 @@ impl CombineOp {
 /// stride `w`) into `dst` at `dst_off` with row stride `dst_stride`.
 /// The weighted forms equal [`weighted_pred_explicit`].
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn combine_partition(
     dst: &mut [i32],
     dst_off: usize,
@@ -5664,26 +5699,96 @@ fn combine_partition(
     op: CombineOp,
     bit_depth: u32,
 ) {
+    match op {
+        CombineOp::Zero => {
+            for y in 0..h {
+                dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w].fill(0);
+            }
+            return;
+        }
+        CombineOp::Copy0 => {
+            for y in 0..h {
+                dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w]
+                    .copy_from_slice(&l0[y * w..y * w + w]);
+            }
+            return;
+        }
+        CombineOp::Copy1 => {
+            for y in 0..h {
+                dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w]
+                    .copy_from_slice(&l1[y * w..y * w + w]);
+            }
+            return;
+        }
+        CombineOp::Avg => {
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use core::arch::aarch64::*;
+                let end4 = w & !3;
+                for y in 0..h {
+                    let dp = dst.as_mut_ptr().add(dst_off + y * dst_stride);
+                    let ap = l0.as_ptr().add(y * w);
+                    let bp = l1.as_ptr().add(y * w);
+                    let mut x = 0;
+                    while x < end4 {
+                        vst1q_s32(dp.add(x), vrhaddq_s32(vld1q_s32(ap.add(x)), vld1q_s32(bp.add(x))));
+                        x += 4;
+                    }
+                    for c in end4..w {
+                        *dp.add(c) = (*ap.add(c) + *bp.add(c) + 1) >> 1;
+                    }
+                }
+                return;
+            }
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            unsafe {
+                use core::arch::wasm32::*;
+                let end4 = w & !3;
+                let one = i32x4_splat(1);
+                for y in 0..h {
+                    let dp = dst.as_mut_ptr().add(dst_off + y * dst_stride);
+                    let ap = l0.as_ptr().add(y * w);
+                    let bp = l1.as_ptr().add(y * w);
+                    let mut x = 0;
+                    while x < end4 {
+                        let s = i32x4_add(i32x4_add(v128_load(ap.add(x).cast()), v128_load(bp.add(x).cast())), one);
+                        v128_store(dp.add(x).cast(), i32x4_shr(s, 1));
+                        x += 4;
+                    }
+                    for c in end4..w {
+                        *dp.add(c) = (*ap.add(c) + *bp.add(c) + 1) >> 1;
+                    }
+                }
+                return;
+            }
+            #[allow(unreachable_code)]
+            {
+                for y in 0..h {
+                    let d = &mut dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w];
+                    let a = &l0[y * w..y * w + w];
+                    let b = &l1[y * w..y * w + w];
+                    for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
+                        *d = (p0 + p1 + 1) >> 1;
+                    }
+                }
+                return;
+            }
+        }
+        CombineOp::Weighted { .. } => {}
+    }
     let max_v = (1i32 << bit_depth) - 1;
     for y in 0..h {
         let d = &mut dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w];
         let a = &l0[y * w..y * w + w];
         let b = &l1[y * w..y * w + w];
-        match op {
-            CombineOp::Zero => d.fill(0),
-            CombineOp::Copy0 => d.copy_from_slice(a),
-            CombineOp::Copy1 => d.copy_from_slice(b),
-            CombineOp::Avg => {
-                for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
-                    *d = (p0 + p1 + 1) >> 1;
-                }
-            }
-            CombineOp::Weighted {
-                mode,
-                w0,
-                w1,
-                log2_wd,
-            } => match mode {
+        if let CombineOp::Weighted {
+            mode,
+            w0,
+            w1,
+            log2_wd,
+        } = op
+        {
+            match mode {
                 BiPredMode::L0Only | BiPredMode::L1Only => {
                     let (src, e) = if mode == BiPredMode::L0Only {
                         (a, w0)
@@ -5711,7 +5816,7 @@ fn combine_partition(
                         *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -8606,13 +8711,23 @@ fn reconstruct_inter_chroma_residual(
     // No §8.5.15 DPCM on inter macroblocks.
     let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
     let bypass = transform_bypass_active(sps, qp_prime_y);
+    if cbp_chroma == 0 {
+        if !bypass {
+            crate::transform::check_transform_params(qp_cb, bit_depth_c)?;
+            crate::transform::check_transform_params(qp_cr, bit_depth_c)?;
+        }
+        let (_, mbh_c) = chroma_mb_dims(chroma_array_type);
+        let n_c = (mbw_c * mbh_c) as usize;
+        writer.write_chroma_mb(pic, 0, &pred_cb[..n_c], mbw_c as usize, mbh_c as usize);
+        writer.write_chroma_mb(pic, 1, &pred_cr[..n_c], mbw_c as usize, mbh_c as usize);
+        return Ok(());
+    }
 
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
     let sl4_cb = select_scaling_list_4x4(4, sps, pps);
     let sl4_cr = select_scaling_list_4x4(5, sps, pps);
     let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
     let n_ac = 4 * num_c8x8 as usize;
-
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
@@ -10977,7 +11092,16 @@ fn deblock_luma_mb_frame(
                 },
             )
         };
-        for edge_off in 0..4i32 {
+        let skip_internal = !q_info.is_intra
+            && q_info.luma_nonzero_4x4 == 0
+            && !q_info.in_sp_si_slice
+            && *q_uniform.get_or_insert_with(|| uniform_motion(q_info));
+        if skip_internal {
+            let base = if vertical { 0 } else { 16 };
+            luma_bs[base + 4..base + 16].fill(0);
+        }
+        let max_edge = if skip_internal { 1i32 } else { 4i32 };
+        for edge_off in 0..max_edge {
             let edge = edge_mb * 16 + edge_off * 4;
             if edge == 0 || edge >= if vertical { w } else { h } {
                 continue;
@@ -11181,6 +11305,93 @@ fn deblock_chroma_mb(
     mb_field_flags: &[bool],
     luma_bs: &[u8],
 ) {
+    if !mbaff_frame_flag && pic.chroma_array_type == 1 && !deblock_trace_enabled() {
+        let v0 = mb_x > 0 && luma_bs[0..4].iter().any(|&b| b > 0 && b != BS_NOT_DERIVED);
+        let v2 = luma_bs[8..12] != [0; 4];
+        let h0 = mb_y > 0 && luma_bs[16..20].iter().any(|&b| b > 0 && b != BS_NOT_DERIVED);
+        let h2 = luma_bs[24..28] != [0; 4];
+        if !(v0 || v2 || h0 || h2) {
+            return;
+        }
+        let mb_w = grid.width_in_mbs as usize;
+        let addr = mb_y as usize * mb_w + mb_x as usize;
+        let Some(q_info) = grid.info.get(addr).filter(|i| i.available) else {
+            return;
+        };
+        let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
+        let c_off = if plane == 0 { cb_offset } else { cr_offset };
+        if v0
+            && mb_x * 8 < cw
+            && let Some(p_info) = grid.info.get(addr - 1).filter(|i| i.available)
+        {
+            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
+            for sub in 0..4usize {
+                let y0 = mb_y * 8 + (sub * 2) as i32;
+                if y0 >= ch {
+                    break;
+                }
+                let bs = luma_bs[sub];
+                if bs > 0 && bs != BS_NOT_DERIVED {
+                    filter_chroma_vertical_rows(
+                        pic, plane, mb_x * 8, y0 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
+                        bit_depth,
+                    );
+                }
+            }
+        }
+        if v2 && mb_x * 8 + 4 < cw {
+            let qp_avg = chroma_qp_avg(q_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
+            for sub in 0..4usize {
+                let y0 = mb_y * 8 + (sub * 2) as i32;
+                if y0 >= ch {
+                    break;
+                }
+                let bs = luma_bs[8 + sub];
+                if bs > 0 && bs != BS_NOT_DERIVED {
+                    filter_chroma_vertical_rows(
+                        pic, plane, mb_x * 8 + 4, y0 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
+                        bit_depth,
+                    );
+                }
+            }
+        }
+        if h0
+            && mb_y * 8 < ch
+            && let Some(p_info) = grid.info.get(addr - mb_w).filter(|i| i.available)
+        {
+            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
+            for sub in 0..4usize {
+                let x0 = mb_x * 8 + (sub * 2) as i32;
+                if x0 >= cw {
+                    break;
+                }
+                let bs = luma_bs[16 + sub];
+                if bs > 0 && bs != BS_NOT_DERIVED {
+                    filter_chroma_horizontal_cols(
+                        pic, plane, x0, mb_y * 8 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
+                        bit_depth,
+                    );
+                }
+            }
+        }
+        if h2 && mb_y * 8 + 4 < ch {
+            let qp_avg = chroma_qp_avg(q_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
+            for sub in 0..4usize {
+                let x0 = mb_x * 8 + (sub * 2) as i32;
+                if x0 >= cw {
+                    break;
+                }
+                let bs = luma_bs[24 + sub];
+                if bs > 0 && bs != BS_NOT_DERIVED {
+                    filter_chroma_horizontal_cols(
+                        pic, plane, x0, mb_y * 8 + 4 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
+                        bit_depth,
+                    );
+                }
+            }
+        }
+        return;
+    }
     // §7.4.2.1.1 eq. 7-6 / §8.5.8 eq. 8-311 — QpBdOffsetC = 6 *
     // bit_depth_chroma_minus8. Threaded into chroma_qp_avg so the §8.7.2
     // QPC derivation runs with the extended `−QpBdOffsetC..=51` qPI
@@ -11983,37 +12194,37 @@ fn filter_vertical_edge_luma(
     if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
         let stride = pic_w as usize;
         let base_x = (edge_x - 4) as usize;
+        let y = y0 as usize;
+        let mut p3 = [0i32; 4];
+        let mut p2 = [0i32; 4];
+        let mut p1 = [0i32; 4];
+        let mut p0 = [0i32; 4];
+        let mut q0 = [0i32; 4];
+        let mut q1 = [0i32; 4];
+        let mut q2 = [0i32; 4];
+        let mut q3 = [0i32; 4];
         for dy in 0..4 {
-            let y = (y0 + dy) as usize;
-            let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            row[1] = p2;
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
-            row[6] = q2;
+            let r = &pic.luma[(y + dy) * stride + base_x..(y + dy) * stride + base_x + 8];
+            p3[dy] = r[0];
+            p2[dy] = r[1];
+            p1[dy] = r[2];
+            p0[dy] = r[3];
+            q0[dy] = r[4];
+            q1[dy] = r[5];
+            q2[dy] = r[6];
+            q3[dy] = r[7];
+        }
+        crate::deblock::filter_luma_4(
+            p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, q3, params,
+        );
+        for dy in 0..4 {
+            let r = &mut pic.luma[(y + dy) * stride + base_x + 1..(y + dy) * stride + base_x + 7];
+            r[0] = p2[dy];
+            r[1] = p1[dy];
+            r[2] = p0[dy];
+            r[3] = q0[dy];
+            r[4] = q1[dy];
+            r[5] = q2[dy];
         }
         return;
     }
@@ -12088,41 +12299,28 @@ fn filter_horizontal_edge_luma(
     let pic_h = pic.height_in_samples as i32;
     if x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
         let stride = pic_w as usize;
-        // For horizontal edges, the 8 samples are in 8 different rows at
-        // the same column. We split-borrow row-by-row.
-        for dx in 0..4 {
-            let x = (x0 + dx) as usize;
-            let p3_idx = ((edge_y - 4) as usize) * stride + x;
-            let q3_idx = ((edge_y + 3) as usize) * stride + x;
-            let p3 = pic.luma[p3_idx];
-            let q3 = pic.luma[q3_idx];
-            let mut p2 = pic.luma[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = pic.luma[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = pic.luma[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = pic.luma[((edge_y) as usize) * stride + x];
-            let mut q1 = pic.luma[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = pic.luma[((edge_y + 2) as usize) * stride + x];
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            pic.luma[((edge_y - 3) as usize) * stride + x] = p2;
-            pic.luma[((edge_y - 2) as usize) * stride + x] = p1;
-            pic.luma[((edge_y - 1) as usize) * stride + x] = p0;
-            pic.luma[((edge_y) as usize) * stride + x] = q0;
-            pic.luma[((edge_y + 1) as usize) * stride + x] = q1;
-            pic.luma[((edge_y + 2) as usize) * stride + x] = q2;
-        }
+        let x = x0 as usize;
+        let ey = edge_y as usize;
+        let get4 = |luma: &[i32], row: usize| -> [i32; 4] {
+            luma[row * stride + x..row * stride + x + 4].try_into().unwrap()
+        };
+        let p3 = get4(&pic.luma, ey - 4);
+        let mut p2 = get4(&pic.luma, ey - 3);
+        let mut p1 = get4(&pic.luma, ey - 2);
+        let mut p0 = get4(&pic.luma, ey - 1);
+        let mut q0 = get4(&pic.luma, ey);
+        let mut q1 = get4(&pic.luma, ey + 1);
+        let mut q2 = get4(&pic.luma, ey + 2);
+        let q3 = get4(&pic.luma, ey + 3);
+        crate::deblock::filter_luma_4(
+            p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, q3, params,
+        );
+        pic.luma[(ey - 3) * stride + x..(ey - 3) * stride + x + 4].copy_from_slice(&p2);
+        pic.luma[(ey - 2) * stride + x..(ey - 2) * stride + x + 4].copy_from_slice(&p1);
+        pic.luma[(ey - 1) * stride + x..(ey - 1) * stride + x + 4].copy_from_slice(&p0);
+        pic.luma[ey * stride + x..ey * stride + x + 4].copy_from_slice(&q0);
+        pic.luma[(ey + 1) * stride + x..(ey + 1) * stride + x + 4].copy_from_slice(&q1);
+        pic.luma[(ey + 2) * stride + x..(ey + 2) * stride + x + 4].copy_from_slice(&q2);
         return;
     }
     for dx in 0..4 {

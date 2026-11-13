@@ -264,6 +264,7 @@ impl Sps {
     ///
     /// Both the VUI body (§E.1) and the scaling_list body
     /// (§7.3.2.1.1.1) are fully parsed inline.
+    #[cold]
     pub fn parse(rbsp: &[u8]) -> Result<Self, SpsError> {
         let mut r = BitReader::new(rbsp);
         let sps = Self::parse_seq_parameter_set_data(&mut r)?;
@@ -282,6 +283,7 @@ impl Sps {
     /// `subset_seq_parameter_set_rbsp()` (§7.3.2.1.3, see
     /// [`crate::subset_sps::SubsetSps::parse`]) — the latter continues
     /// reading a per-profile extension structure after this one.
+    #[cold]
     pub fn parse_seq_parameter_set_data(r: &mut BitReader<'_>) -> Result<Self, SpsError> {
         // §7.3.2.1.1 — profile_idc / constraint_setN_flag / reserved_zero_2bits / level_idc.
         let profile_idc = r.u(8)? as u8;

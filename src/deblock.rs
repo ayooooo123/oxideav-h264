@@ -364,43 +364,267 @@ pub fn derive_boundary_strength(inputs: BsInputs) -> u8 {
 /// `plane = Chroma` means `chromaEdgeFlag == 1` AND the caller has
 /// decided `ChromaArrayType != 3` (so `chromaStyleFilteringFlag == 1`
 /// per eq. 8-450). For 4:4:4 chroma, callers should pass `Luma`.
+#[inline(always)]
 pub fn filter_edge(plane: Plane, mut samples: EdgeSamples<'_>, params: FilterParams) {
-    // §8.7.2.2 — early-out on bS == 0.
     if params.bs == 0 {
         return;
     }
-
-    // §8.7.2.2 — eq. 8-454 / 8-455.
     let index_a = clip3(0, 51, params.qp_avg + params.filter_offset_a);
     let index_b = clip3(0, 51, params.qp_avg + params.filter_offset_b);
-
-    // §8.7.2.2 — eq. 8-456..8-459.
+    if index_a < 16 || index_b < 16 {
+        return;
+    }
     let alpha = alpha_from_index(index_a, params.bit_depth);
     let beta = beta_from_index(index_b, params.bit_depth);
 
-    // §8.7.2.2 — eq. 8-460. filterSamplesFlag.
     let p0 = *samples.p0;
     let q0 = *samples.q0;
     let p1 = *samples.p1;
     let q1 = *samples.q1;
-    let filter_samples = params.bs != 0
-        && (p0 - q0).abs() < alpha
-        && (p1 - p0).abs() < beta
-        && (q1 - q0).abs() < beta;
-
-    if !filter_samples {
-        // eq. 8-451 / 8-452 — identity, samples already unchanged.
+    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
         return;
     }
 
     let chroma_style = matches!(plane, Plane::Chroma);
-
     if params.bs < 4 {
-        // §8.7.2.3 — normal filter.
         filter_normal(&mut samples, params, index_a, beta, chroma_style);
     } else {
-        // §8.7.2.4 — strong filter (bS == 4).
         filter_strong(&mut samples, alpha, beta, chroma_style);
+    }
+}
+
+/// 4-lane vectorized §8.7.2.2–§8.7.2.4 luma edge filter across all 4 samples of a 4x4 block edge.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn filter_luma_4(
+    p3: [i32; 4],
+    p2: &mut [i32; 4],
+    p1: &mut [i32; 4],
+    p0: &mut [i32; 4],
+    q0: &mut [i32; 4],
+    q1: &mut [i32; 4],
+    q2: &mut [i32; 4],
+    q3: [i32; 4],
+    params: FilterParams,
+) {
+    if params.bs == 0 {
+        return;
+    }
+    let index_a = clip3(0, 51, params.qp_avg + params.filter_offset_a);
+    let index_b = clip3(0, 51, params.qp_avg + params.filter_offset_b);
+    if index_a < 16 || index_b < 16 {
+        return;
+    }
+    let alpha = alpha_from_index(index_a, params.bit_depth);
+    let beta = beta_from_index(index_b, params.bit_depth);
+    let max_v = (1i32 << params.bit_depth) - 1;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        unsafe {
+            let vp0 = vld1q_s32(p0.as_ptr());
+            let vq0 = vld1q_s32(q0.as_ptr());
+            let vp1 = vld1q_s32(p1.as_ptr());
+            let vq1 = vld1q_s32(q1.as_ptr());
+            let m0 = vcltq_s32(vabdq_s32(vp0, vq0), vdupq_n_s32(alpha));
+            let m1 = vcltq_s32(vabdq_s32(vp1, vp0), vdupq_n_s32(beta));
+            let m2 = vcltq_s32(vabdq_s32(vq1, vq0), vdupq_n_s32(beta));
+            let active = vandq_u32(m0, vandq_u32(m1, m2));
+            if vmaxvq_u32(active) == 0 {
+                return;
+            }
+            let vp2 = vld1q_s32(p2.as_ptr());
+            let vq2 = vld1q_s32(q2.as_ptr());
+            let ap_lt = vcltq_s32(vabdq_s32(vp2, vp0), vdupq_n_s32(beta));
+            let aq_lt = vcltq_s32(vabdq_s32(vq2, vq0), vdupq_n_s32(beta));
+            let zero = vdupq_n_s32(0);
+            let top = vdupq_n_s32(max_v);
+            if params.bs < 4 {
+                let tc0_s = tc0_from(params.bs, index_a, params.bit_depth);
+                let vtc0 = vdupq_n_s32(tc0_s);
+                let vtc = vsubq_s32(vsubq_s32(vtc0, vreinterpretq_s32_u32(ap_lt)), vreinterpretq_s32_u32(aq_lt));
+                let raw_d = vshrq_n_s32::<3>(vaddq_s32(
+                    vaddq_s32(vshlq_n_s32::<2>(vsubq_s32(vq0, vp0)), vsubq_s32(vp1, vq1)),
+                    vdupq_n_s32(4),
+                ));
+                let delta = vmaxq_s32(vnegq_s32(vtc), vminq_s32(vtc, raw_d));
+                let np0 = vmaxq_s32(zero, vminq_s32(top, vaddq_s32(vp0, delta)));
+                let nq0 = vmaxq_s32(zero, vminq_s32(top, vsubq_s32(vq0, delta)));
+                let avg0 = vrhaddq_s32(vp0, vq0);
+                let step_p = vmaxq_s32(
+                    vnegq_s32(vtc0),
+                    vminq_s32(vtc0, vshrq_n_s32::<1>(vsubq_s32(vaddq_s32(vp2, avg0), vshlq_n_s32::<1>(vp1)))),
+                );
+                let step_q = vmaxq_s32(
+                    vnegq_s32(vtc0),
+                    vminq_s32(vtc0, vshrq_n_s32::<1>(vsubq_s32(vaddq_s32(vq2, avg0), vshlq_n_s32::<1>(vq1)))),
+                );
+                let np1 = vaddq_s32(vp1, step_p);
+                let nq1 = vaddq_s32(vq1, step_q);
+                vst1q_s32(p0.as_mut_ptr(), vbslq_s32(active, np0, vp0));
+                vst1q_s32(q0.as_mut_ptr(), vbslq_s32(active, nq0, vq0));
+                vst1q_s32(p1.as_mut_ptr(), vbslq_s32(vandq_u32(active, ap_lt), np1, vp1));
+                vst1q_s32(q1.as_mut_ptr(), vbslq_s32(vandq_u32(active, aq_lt), nq1, vq1));
+            } else {
+                let vp3 = vld1q_s32(p3.as_ptr());
+                let vq3 = vld1q_s32(q3.as_ptr());
+                let small = vcltq_s32(vabdq_s32(vp0, vq0), vdupq_n_s32((alpha >> 2) + 2));
+                let sp = vandq_u32(ap_lt, small);
+                let sq = vandq_u32(aq_lt, small);
+                let c4 = vdupq_n_s32(4);
+                let c2 = vdupq_n_s32(2);
+                let sp0 = vshrq_n_s32::<3>(vaddq_s32(
+                    vaddq_s32(vp2, vq1),
+                    vaddq_s32(vshlq_n_s32::<1>(vaddq_s32(vp1, vaddq_s32(vp0, vq0))), c4),
+                ));
+                let wp0 = vshrq_n_s32::<2>(vaddq_s32(vaddq_s32(vshlq_n_s32::<1>(vp1), vp0), vaddq_s32(vq1, c2)));
+                let sp1 = vshrq_n_s32::<2>(vaddq_s32(vaddq_s32(vp2, vp1), vaddq_s32(vaddq_s32(vp0, vq0), c2)));
+                let sp2 = vshrq_n_s32::<3>(vaddq_s32(
+                    vaddq_s32(vshlq_n_s32::<1>(vp3), vmulq_n_s32(vp2, 3)),
+                    vaddq_s32(vaddq_s32(vp1, vp0), vaddq_s32(vq0, c4)),
+                ));
+                let sq0 = vshrq_n_s32::<3>(vaddq_s32(
+                    vaddq_s32(vp1, vq2),
+                    vaddq_s32(vshlq_n_s32::<1>(vaddq_s32(vp0, vaddq_s32(vq0, vq1))), c4),
+                ));
+                let wq0 = vshrq_n_s32::<2>(vaddq_s32(vaddq_s32(vshlq_n_s32::<1>(vq1), vq0), vaddq_s32(vp1, c2)));
+                let sq1 = vshrq_n_s32::<2>(vaddq_s32(vaddq_s32(vp0, vq0), vaddq_s32(vaddq_s32(vq1, vq2), c2)));
+                let sq2 = vshrq_n_s32::<3>(vaddq_s32(
+                    vaddq_s32(vshlq_n_s32::<1>(vq3), vmulq_n_s32(vq2, 3)),
+                    vaddq_s32(vaddq_s32(vq1, vq0), vaddq_s32(vp0, c4)),
+                ));
+                let act_sp = vandq_u32(active, sp);
+                let act_sq = vandq_u32(active, sq);
+                vst1q_s32(p0.as_mut_ptr(), vbslq_s32(active, vbslq_s32(sp, sp0, wp0), vp0));
+                vst1q_s32(p1.as_mut_ptr(), vbslq_s32(act_sp, sp1, vp1));
+                vst1q_s32(p2.as_mut_ptr(), vbslq_s32(act_sp, sp2, vp2));
+                vst1q_s32(q0.as_mut_ptr(), vbslq_s32(active, vbslq_s32(sq, sq0, wq0), vq0));
+                vst1q_s32(q1.as_mut_ptr(), vbslq_s32(act_sq, sq1, vq1));
+                vst1q_s32(q2.as_mut_ptr(), vbslq_s32(act_sq, sq2, vq2));
+            }
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use core::arch::wasm32::*;
+        unsafe {
+            let vp0 = v128_load(p0.as_ptr().cast());
+            let vq0 = v128_load(q0.as_ptr().cast());
+            let vp1 = v128_load(p1.as_ptr().cast());
+            let vq1 = v128_load(q1.as_ptr().cast());
+            let m0 = i32x4_lt(i32x4_abs(i32x4_sub(vp0, vq0)), i32x4_splat(alpha));
+            let m1 = i32x4_lt(i32x4_abs(i32x4_sub(vp1, vp0)), i32x4_splat(beta));
+            let m2 = i32x4_lt(i32x4_abs(i32x4_sub(vq1, vq0)), i32x4_splat(beta));
+            let active = v128_and(m0, v128_and(m1, m2));
+            if !v128_any_true(active) {
+                return;
+            }
+            let vp2 = v128_load(p2.as_ptr().cast());
+            let vq2 = v128_load(q2.as_ptr().cast());
+            let ap_lt = i32x4_lt(i32x4_abs(i32x4_sub(vp2, vp0)), i32x4_splat(beta));
+            let aq_lt = i32x4_lt(i32x4_abs(i32x4_sub(vq2, vq0)), i32x4_splat(beta));
+            let zero = i32x4_splat(0);
+            let top = i32x4_splat(max_v);
+            if params.bs < 4 {
+                let tc0_s = tc0_from(params.bs, index_a, params.bit_depth);
+                let vtc0 = i32x4_splat(tc0_s);
+                let vtc = i32x4_sub(i32x4_sub(vtc0, ap_lt), aq_lt);
+                let raw_d = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(i32x4_shl(i32x4_sub(vq0, vp0), 2), i32x4_sub(vp1, vq1)),
+                        i32x4_splat(4),
+                    ),
+                    3,
+                );
+                let delta = i32x4_max(i32x4_neg(vtc), i32x4_min(vtc, raw_d));
+                let np0 = i32x4_max(zero, i32x4_min(top, i32x4_add(vp0, delta)));
+                let nq0 = i32x4_max(zero, i32x4_min(top, i32x4_sub(vq0, delta)));
+                let avg0 = i32x4_shr(i32x4_add(i32x4_add(vp0, vq0), i32x4_splat(1)), 1);
+                let step_p = i32x4_max(
+                    i32x4_neg(vtc0),
+                    i32x4_min(vtc0, i32x4_shr(i32x4_sub(i32x4_add(vp2, avg0), i32x4_shl(vp1, 1)), 1)),
+                );
+                let step_q = i32x4_max(
+                    i32x4_neg(vtc0),
+                    i32x4_min(vtc0, i32x4_shr(i32x4_sub(i32x4_add(vq2, avg0), i32x4_shl(vq1, 1)), 1)),
+                );
+                v128_store(p0.as_mut_ptr().cast(), v128_bitselect(np0, vp0, active));
+                v128_store(q0.as_mut_ptr().cast(), v128_bitselect(nq0, vq0, active));
+                v128_store(p1.as_mut_ptr().cast(), v128_bitselect(i32x4_add(vp1, step_p), vp1, v128_and(active, ap_lt)));
+                v128_store(q1.as_mut_ptr().cast(), v128_bitselect(i32x4_add(vq1, step_q), vq1, v128_and(active, aq_lt)));
+            } else {
+                let vp3 = v128_load(p3.as_ptr().cast());
+                let vq3 = v128_load(q3.as_ptr().cast());
+                let small = i32x4_lt(i32x4_abs(i32x4_sub(vp0, vq0)), i32x4_splat((alpha >> 2) + 2));
+                let sp = v128_and(ap_lt, small);
+                let sq = v128_and(aq_lt, small);
+                let c4 = i32x4_splat(4);
+                let c2 = i32x4_splat(2);
+                let sp0 = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(vp2, vq1),
+                        i32x4_add(i32x4_shl(i32x4_add(vp1, i32x4_add(vp0, vq0)), 1), c4),
+                    ),
+                    3,
+                );
+                let wp0 = i32x4_shr(i32x4_add(i32x4_add(i32x4_shl(vp1, 1), vp0), i32x4_add(vq1, c2)), 2);
+                let sp1 = i32x4_shr(i32x4_add(i32x4_add(vp2, vp1), i32x4_add(i32x4_add(vp0, vq0), c2)), 2);
+                let sp2 = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(i32x4_shl(vp3, 1), i32x4_mul(vp2, i32x4_splat(3))),
+                        i32x4_add(i32x4_add(vp1, vp0), i32x4_add(vq0, c4)),
+                    ),
+                    3,
+                );
+                let sq0 = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(vp1, vq2),
+                        i32x4_add(i32x4_shl(i32x4_add(vp0, i32x4_add(vq0, vq1)), 1), c4),
+                    ),
+                    3,
+                );
+                let wq0 = i32x4_shr(i32x4_add(i32x4_add(i32x4_shl(vq1, 1), vq0), i32x4_add(vp1, c2)), 2);
+                let sq1 = i32x4_shr(i32x4_add(i32x4_add(vp0, vq0), i32x4_add(i32x4_add(vq1, vq2), c2)), 2);
+                let sq2 = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(i32x4_shl(vq3, 1), i32x4_mul(vq2, i32x4_splat(3))),
+                        i32x4_add(i32x4_add(vq1, vq0), i32x4_add(vp0, c4)),
+                    ),
+                    3,
+                );
+                let act_sp = v128_and(active, sp);
+                let act_sq = v128_and(active, sq);
+                v128_store(p0.as_mut_ptr().cast(), v128_bitselect(v128_bitselect(sp0, wp0, sp), vp0, active));
+                v128_store(p1.as_mut_ptr().cast(), v128_bitselect(sp1, vp1, act_sp));
+                v128_store(p2.as_mut_ptr().cast(), v128_bitselect(sp2, vp2, act_sp));
+                v128_store(q0.as_mut_ptr().cast(), v128_bitselect(v128_bitselect(sq0, wq0, sq), vq0, active));
+                v128_store(q1.as_mut_ptr().cast(), v128_bitselect(sq1, vq1, act_sq));
+                v128_store(q2.as_mut_ptr().cast(), v128_bitselect(sq2, vq2, act_sq));
+            }
+        }
+        return;
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    for k in 0..4 {
+        filter_edge(
+            Plane::Luma,
+            EdgeSamples {
+                p3: p3[k],
+                p2: &mut p2[k],
+                p1: &mut p1[k],
+                p0: &mut p0[k],
+                q0: &mut q0[k],
+                q1: &mut q1[k],
+                q2: &mut q2[k],
+                q3: q3[k],
+            },
+            params,
+        );
     }
 }
 

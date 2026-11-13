@@ -158,6 +158,7 @@ impl Pps {
     /// to [`Pps::parse_with_chroma_format(rbsp, 1)`]. Safe for the common
     /// case; for 4:4:4 streams where `pic_scaling_matrix_present_flag`
     /// might be set, prefer [`Pps::parse_with_chroma_format`].
+    #[cold]
     pub fn parse(rbsp: &[u8]) -> Result<Self, PpsError> {
         Self::parse_with_chroma_format(rbsp, 1)
     }
@@ -167,6 +168,7 @@ impl Pps {
     /// consulted when `pic_scaling_matrix_present_flag == 1` and
     /// `transform_8x8_mode_flag == 1`: it determines whether the
     /// 8x8 tail carries 2 lists (4:2:0 / 4:2:2) or 6 lists (4:4:4).
+    #[cold]
     pub fn parse_with_chroma_format(rbsp: &[u8], chroma_format_idc: u32) -> Result<Self, PpsError> {
         let mut r = BitReader::new(rbsp);
 

@@ -595,15 +595,30 @@ impl H264CodecDecoder {
     /// (and waits for it after `flush`), and the per-NAL bookkeeping
     /// ([`Self::decode_error_count`], `last_slice`) trails the input by
     /// up to a budget's worth of slices until `flush`.
-    pub fn set_threads(&mut self, threads: usize) {
-        let threads = threads.max(1);
-        if threads != self.threads {
-            // Finish the work of the old budget first: replay held-back
-            // events and let in-flight pictures complete.
-            self.ft_pump(true);
-            self.ft_shutdown();
+    #[inline(always)]
+    fn worker_threads(&self) -> usize {
+        if cfg!(target_arch = "wasm32") {
+            1
+        } else {
+            self.threads
         }
-        self.threads = threads;
+    }
+
+    pub fn set_threads(&mut self, threads: usize) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = threads;
+            self.threads = 1;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let threads = threads.max(1);
+            if threads != self.threads {
+                self.ft_pump(true);
+                self.ft_shutdown();
+            }
+            self.threads = threads;
+        }
     }
 
     /// §5.2.4.1.1 ISO/IEC 14496-15 — `AVCDecoderConfigurationRecord`.
@@ -1322,7 +1337,7 @@ impl H264CodecDecoder {
             // the pool when it qualifies; otherwise the serial path
             // below reads reference samples, so the pool's pictures
             // must be complete and stored with their samples.
-            let use_ft = self.threads > 1
+            let use_ft = self.worker_threads() > 1
                 && dp.is_none()
                 && reconstruct::ft_eligible_slice(&header, &sps, &pps);
             if !use_ft {
@@ -2083,7 +2098,7 @@ impl H264CodecDecoder {
                 &provider,
                 &mut in_progress.pic,
                 &mut in_progress.grid,
-                self.threads,
+                if cfg!(target_arch = "wasm32") { 1 } else { self.threads },
             )
             .map(|()| sd.mb_field_decoding_flags)
         };
@@ -2359,7 +2374,7 @@ impl H264CodecDecoder {
                 mbaff_frame_flag,
                 first_header.field_pic_flag,
                 &mb_field_flags,
-                self.threads,
+                self.worker_threads(),
             );
         }
 
@@ -3340,7 +3355,7 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.threads > 1 {
+        if self.worker_threads() > 1 {
             self.ft_ensure();
             if let Some(ft) = self.ft.as_mut() {
                 ft.queue
@@ -3521,9 +3536,9 @@ impl H264CodecDecoder {
 
     /// Frame threading — create the worker pool for the budget.
     fn ft_ensure(&mut self) {
-        if self.ft.is_none() && self.threads > 1 {
+        if self.ft.is_none() && self.worker_threads() > 1 {
             self.ft = Some(FtState {
-                pool: Pool::new(self.threads),
+                pool: Pool::new(self.worker_threads()),
                 queue: VecDeque::new(),
                 queued_slices: 0,
                 slots: HashMap::new(),

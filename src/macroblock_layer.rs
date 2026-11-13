@@ -64,29 +64,44 @@ use crate::sps::Sps;
 // We resolve each env var **once** on first access via `OnceLock` and
 // thereafter return the cached boolean / parsed value.
 
-#[inline]
+#[inline(always)]
 fn dbg_general_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_DEBUG").is_ok())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var("OXIDEAV_H264_DEBUG").is_ok());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-#[inline]
+#[inline(always)]
 fn dbg_mbtype_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("OXIDEAV_H264_MBTYPE_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-#[inline]
+#[inline(always)]
 fn dbg_mb_trace_target() -> Option<u32> {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("OXIDEAV_H264_MB_TRACE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-    })
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<Option<u32>> = LazyLock::new(|| {
+            std::env::var("OXIDEAV_H264_MB_TRACE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+        });
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3241,7 +3256,7 @@ fn parse_mb_pred(
                     );
                 }
                 // Record per-8x8-partition value covering this mb part.
-                for p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
+                for &p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
                     curr_nb.ref_idx_l0[p8 as usize] = v.min(127) as i8;
                 }
                 pred.ref_idx_l0.push(v);
@@ -3271,7 +3286,7 @@ fn parse_mb_pred(
                 } else {
                     r.te(x_l1)?
                 };
-                for p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
+                for &p8 in partition_8x8_range(num_parts, part, mb_type.is_partitioned_16x8()) {
                     curr_nb.ref_idx_l1[p8 as usize] = v.min(127) as i8;
                 }
                 pred.ref_idx_l1.push(v);
@@ -3327,7 +3342,7 @@ fn parse_mb_pred(
                     // Propagate decoded mvd to ALL 4x4 blocks covered by
                     // this partition (so in-MB neighbour lookups see
                     // consistent values).
-                    for b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
+                    for &b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
                         curr_nb.mvd_l0_x[b4 as usize] =
                             mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         curr_nb.mvd_l0_y[b4 as usize] =
@@ -3370,7 +3385,7 @@ fn parse_mb_pred(
                     );
                     let mx = decode_mvd_lx(dec, ctxs, MvdComponent::X, sum_x)?;
                     let my = decode_mvd_lx(dec, ctxs, MvdComponent::Y, sum_y)?;
-                    for b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
+                    for &b4 in mb_part_4x4_range(num_parts, part, mb_type.is_partitioned_16x8()) {
                         curr_nb.mvd_l1_x[b4 as usize] =
                             mx.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         curr_nb.mvd_l1_y[b4 as usize] =
@@ -3410,31 +3425,33 @@ fn parse_mb_pred(
 /// `num_parts` total partitions. For 16x16 this is 0..=3; for 16x8 part 0
 /// covers 0..=1 and part 1 covers 2..=3; for 8x16 part 0 covers 0,2 and
 /// part 1 covers 1,3.
-fn partition_8x8_range(num_parts: usize, part: usize, is_16x8: bool) -> Vec<u8> {
+fn partition_8x8_range(num_parts: usize, part: usize, is_16x8: bool) -> &'static [u8] {
     match (num_parts, part, is_16x8) {
-        (1, _, _) => vec![0, 1, 2, 3],
-        (2, 0, true) => vec![0, 1],  // 16x8 top
-        (2, 1, true) => vec![2, 3],  // 16x8 bottom
-        (2, 0, false) => vec![0, 2], // 8x16 left
-        (2, 1, false) => vec![1, 3], // 8x16 right
-        (4, p, _) => vec![p as u8],
-        _ => vec![0],
+        (1, _, _) => &[0, 1, 2, 3],
+        (2, 0, true) => &[0, 1],
+        (2, 1, true) => &[2, 3],
+        (2, 0, false) => &[0, 2],
+        (2, 1, false) => &[1, 3],
+        (4, 0, _) => &[0],
+        (4, 1, _) => &[1],
+        (4, 2, _) => &[2],
+        (4, 3, _) => &[3],
+        _ => &[0],
     }
 }
 
-/// Range of 4x4 block indices covered by mb partition `part`.
-fn mb_part_4x4_range(num_parts: usize, part: usize, is_16x8: bool) -> Vec<u8> {
+fn mb_part_4x4_range(num_parts: usize, part: usize, is_16x8: bool) -> &'static [u8] {
     match (num_parts, part, is_16x8) {
-        (1, _, _) => (0..16u8).collect(),
-        (2, 0, true) => vec![0, 1, 2, 3, 4, 5, 6, 7], // 16x8 top half
-        (2, 1, true) => vec![8, 9, 10, 11, 12, 13, 14, 15], // 16x8 bottom half
-        (2, 0, false) => vec![0, 1, 2, 3, 8, 9, 10, 11], // 8x16 left half
-        (2, 1, false) => vec![4, 5, 6, 7, 12, 13, 14, 15], // 8x16 right half
-        (4, 0, _) => vec![0, 1, 2, 3],
-        (4, 1, _) => vec![4, 5, 6, 7],
-        (4, 2, _) => vec![8, 9, 10, 11],
-        (4, 3, _) => vec![12, 13, 14, 15],
-        _ => vec![0],
+        (1, _, _) => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        (2, 0, true) => &[0, 1, 2, 3, 4, 5, 6, 7],
+        (2, 1, true) => &[8, 9, 10, 11, 12, 13, 14, 15],
+        (2, 0, false) => &[0, 1, 2, 3, 8, 9, 10, 11],
+        (2, 1, false) => &[4, 5, 6, 7, 12, 13, 14, 15],
+        (4, 0, _) => &[0, 1, 2, 3],
+        (4, 1, _) => &[4, 5, 6, 7],
+        (4, 2, _) => &[8, 9, 10, 11],
+        (4, 3, _) => &[12, 13, 14, 15],
+        _ => &[0],
     }
 }
 

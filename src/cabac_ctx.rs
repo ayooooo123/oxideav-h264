@@ -30,23 +30,28 @@
 
 use crate::cabac::{CabacDecoder, CabacError, CabacResult, CtxState};
 
-#[inline]
+#[inline(always)]
 fn dbg_enabled() -> bool {
-    // Separate switch from OXIDEAV_H264_DEBUG to avoid drowning the
-    // macroblock-layer logs. Cached once — see `cabac::bin_trace_enabled`
-    // for the rationale: this is called on every per-syntax decode and
-    // a `getenv()` syscall per call dominates the decode wall-time on
-    // real 720p content.
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("OXIDEAV_H264_CABAC_DEBUG").is_ok())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var("OXIDEAV_H264_CABAC_DEBUG").is_ok());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
-#[inline]
+#[inline(always)]
 fn ctx17_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some())
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::LazyLock;
+        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some());
+        return *CACHED;
+    }
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 #[inline]
@@ -2034,10 +2039,9 @@ impl InitTable {
 /// Lazily-initialised global init table. Populated from the `TBL_9_*`
 /// slices on first access.
 fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[InitCell; NUM_CTX_IDX]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut arr = [InitCell::none(); NUM_CTX_IDX];
+    use std::sync::LazyLock;
+    static TABLE: LazyLock<Box<[InitCell; NUM_CTX_IDX]>> = LazyLock::new(|| {
+        let mut arr = Box::new([InitCell::none(); NUM_CTX_IDX]);
         for table in &[
             TBL_9_12, TBL_9_13, TBL_9_14, TBL_9_15, TBL_9_16, TBL_9_17, TBL_9_18, TBL_9_19,
             TBL_9_20, TBL_9_21, TBL_9_22, TBL_9_23, TBL_9_24, TBL_9_25, TBL_9_26, TBL_9_27,
@@ -2048,7 +2052,8 @@ fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
             }
         }
         arr
-    })
+    });
+    &TABLE
 }
 
 // ---------------------------------------------------------------------------
