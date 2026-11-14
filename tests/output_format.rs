@@ -43,9 +43,15 @@ fn every_frame_reports_its_own_size_and_layout() {
     dec.send_packet(&packet(STREAM.to_vec())).unwrap();
     dec.flush().unwrap();
     let mut frames = Vec::new();
+    // The in-band shape change, announced right before its first frame.
+    let mut events = Vec::new();
     loop {
         let frame = match dec.receive_frame() {
             Ok(Frame::Video(frame)) => frame,
+            Ok(Frame::StreamParams(p)) => {
+                events.push((p.width, p.height, p.pixel_format, frames.len()));
+                continue;
+            }
             Ok(other) => panic!("expected video, got {other:?}"),
             Err(Error::Eof) => break,
             Err(e) => panic!("receive_frame: {e}"),
@@ -67,6 +73,7 @@ fn every_frame_reports_its_own_size_and_layout() {
         let hash = fnv1a(planes.iter().flat_map(|p| p.data.iter().copied()));
         frames.push((width, height, format, hash));
     }
+    assert_eq!(events, vec![(Some(100), Some(60), Some(PixelFormat::Yuv422P), 3)]);
     let want: Vec<_> = FFMPEG_FRAMES
         .iter()
         .enumerate()

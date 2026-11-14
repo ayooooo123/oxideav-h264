@@ -1,6 +1,6 @@
 [package]
 name = "oxideav-h264"
-version = "0.1.10"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.95"
 # src/recovery.rs ports FFmpeg (see LICENSE-LGPL); the rest is MIT.
@@ -22,7 +22,7 @@ default = []
 nightly = []
 
 [dependencies]
-oxideav-core = "0.1.42"
+oxideav-core = "0.1.43"
 thiserror = "2"
 
 

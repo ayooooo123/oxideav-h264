@@ -30,6 +30,7 @@
 //! sessions.
 
 use crate::encoder::nal::build_filler_nal;
+use crate::encoder::pad::CodedGeometry;
 use crate::encoder::rate_control::{
     RateControlConfig, RateControlMode, RateController, RcFrameKind,
 };
@@ -44,6 +45,7 @@ use crate::vui::{HrdParameters, TimingInfo, VuiParameters};
 
 /// Rate-control selection for a session.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum SessionRateControl {
     /// Fixed QP for every picture — the historical behaviour.
     ConstantQp(i32),
@@ -53,10 +55,14 @@ pub enum SessionRateControl {
 
 /// Session configuration.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SessionConfig {
-    /// Picture width in luma samples (multiple of 16).
+    /// Picture width in luma samples (even — 4:2:0). A width that is
+    /// not a multiple of 16 is coded on a padded grid with the
+    /// §7.4.2.1.1 SPS cropping rectangle restoring it at the decoder.
     pub width: u32,
-    /// Picture height in luma samples (multiple of 16).
+    /// Picture height in luma samples (even; padded + cropped like
+    /// the width).
     pub height: u32,
     /// IDR period in frames: frame `n` is an IDR iff
     /// `n % gop_length == 0`. Must be >= 1 (1 = all-intra).
@@ -79,9 +85,22 @@ pub struct SessionConfig {
     /// (`recovery_frame_cnt = 0`, `exact_match_flag = 1`) to every IDR
     /// access unit, marking it as an exact random-access point.
     pub recovery_point_sei: bool,
+    /// Code luma only: `chroma_format_idc = 0` (4:0:0) under High
+    /// profile (100, §A.2.4 — Baseline / Main have no monochrome
+    /// format). The Cb / Cr planes passed to the session are empty
+    /// slices, and width / height may be odd (`CropUnitX = CropUnitY =
+    /// 1`). Default `false` (4:2:0).
+    pub monochrome: bool,
 }
 
 impl SessionConfig {
+    /// Set [`SessionConfig::monochrome`].
+    #[must_use]
+    pub fn with_monochrome(mut self, v: bool) -> Self {
+        self.monochrome = v;
+        self
+    }
+
     /// Fixed-QP session, CAVLC, one-second GOP at 30 fps.
     pub fn constant_qp(width: u32, height: u32, qp: i32) -> Self {
         Self {
@@ -92,6 +111,7 @@ impl SessionConfig {
             b_frames: 0,
             rate_control: SessionRateControl::ConstantQp(qp),
             recovery_point_sei: false,
+            monochrome: false,
         }
     }
 
@@ -105,12 +125,14 @@ impl SessionConfig {
             b_frames: 0,
             rate_control: SessionRateControl::Controlled(rc),
             recovery_point_sei: false,
+            monochrome: false,
         }
     }
 }
 
 /// Coding kind of one session access unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionFrameKind {
     /// IDR anchor (stream random-access point).
     Idr,
@@ -124,6 +146,7 @@ pub enum SessionFrameKind {
 /// One encoded picture as returned by [`EncoderSession::encode_frame`]
 /// / [`EncoderSession::push_frame`] (in decode order).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionFrame {
     /// Annex B bytes for this access unit: SPS + PPS + IDR slice on
     /// IDR frames, the P or B slice otherwise, plus any CBR filler
@@ -153,6 +176,32 @@ pub struct SessionFrame {
     /// Filler bits appended after the picture (CBR underspend), 0
     /// otherwise.
     pub filler_bits: u64,
+}
+
+impl SessionFrame {
+    /// Build a [`SessionFrame`] from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        annex_b: Vec<u8>,
+        is_idr: bool,
+        kind: SessionFrameKind,
+        display_index: u64,
+        qp: i32,
+        payload_bits: u64,
+        sei_bits: u64,
+        filler_bits: u64,
+    ) -> Self {
+        Self {
+            annex_b,
+            is_idr,
+            kind,
+            display_index,
+            qp,
+            payload_bits,
+            sei_bits,
+            filler_bits,
+        }
+    }
 }
 
 /// Retained state of the most recent reference picture.
@@ -197,6 +246,9 @@ impl PendingFrame {
 pub struct EncoderSession {
     enc: Encoder,
     cfg: SessionConfig,
+    /// Coded grid (`cfg.width` x `cfg.height` rounded up to whole
+    /// macroblocks) and the SPS cropping that restores the picture.
+    geom: CodedGeometry,
     rc: Option<RateController>,
     /// Round-430 — §E.1.2 NAL HRD block emitted in the SPS VUI of
     /// rate-controlled sessions; also supplies the §D.1.2 / §D.1.3
@@ -296,7 +348,7 @@ fn insert_sei_before_first_vcl(annex_b: &[u8], sei: &[u8]) -> Vec<u8> {
 const MAX_VBV_RETRIES: u32 = 6;
 
 impl EncoderSession {
-    /// Create a session. Panics on inconsistent config (non-mod-16
+    /// Create a session. Panics on inconsistent config (zero or odd
     /// dimensions, `gop_length == 0`, invalid QP / rate parameters).
     pub fn new(cfg: SessionConfig) -> Self {
         assert!(cfg.gop_length >= 1, "gop_length must be >= 1");
@@ -307,10 +359,20 @@ impl EncoderSession {
         if let SessionRateControl::ConstantQp(qp) = cfg.rate_control {
             assert!((0..=51).contains(&qp), "constant QP out of 0..=51");
         }
-        let mut ecfg = EncoderConfig::new(cfg.width, cfg.height);
+        let chroma_format_idc = if cfg.monochrome { 0 } else { 1 };
+        let geom = CodedGeometry::new(cfg.width, cfg.height, chroma_format_idc, true)
+            .unwrap_or_else(|e| panic!("session picture size {}x{}: {e}", cfg.width, cfg.height));
+        let mut ecfg = EncoderConfig::new(geom.coded_width, geom.coded_height);
+        ecfg.crop_right = geom.coded_width - cfg.width;
+        ecfg.crop_bottom = geom.coded_height - cfg.height;
+        if cfg.monochrome {
+            // §A.2.4 — High is the lowest profile with a 4:0:0 format.
+            ecfg.chroma_format_idc = 0;
+            ecfg.profile_idc = 100;
+        }
         if cfg.cabac {
             ecfg.cabac = true;
-            ecfg.profile_idc = 77;
+            ecfg.profile_idc = ecfg.profile_idc.max(77);
         }
         if cfg.b_frames > 0 {
             // §A.2.2 — Baseline forbids B slices: promote CAVLC
@@ -351,7 +413,11 @@ impl EncoderSession {
                     ..VuiParameters::default()
                 });
                 (
-                    Some(RateController::new(rcfg, cfg.width, cfg.height)),
+                    Some(RateController::new(
+                        rcfg,
+                        geom.coded_width,
+                        geom.coded_height,
+                    )),
                     Some(hrd),
                 )
             }
@@ -359,6 +425,7 @@ impl EncoderSession {
         Self {
             enc: Encoder::new(ecfg),
             cfg,
+            geom,
             rc,
             hrd,
             idx: 0,
@@ -376,6 +443,13 @@ impl EncoderSession {
     /// will carry (0..=65535). Advances by one per IDR picture.
     pub fn next_idr_pic_id(&self) -> u32 {
         self.next_idr_pic_id
+    }
+
+    /// Continue the §7.4.3 `idr_pic_id` sequence of an earlier session
+    /// (a mid-stream re-configuration), so the IDR opening this one
+    /// never repeats the value of the IDR just before it.
+    pub(crate) fn set_next_idr_pic_id(&mut self, id: u32) {
+        self.next_idr_pic_id = id & 0xFFFF;
     }
 
     /// The SPS + PPS every IDR access unit of this session carries, as
@@ -499,9 +573,31 @@ impl EncoderSession {
     pub fn push_frame(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Vec<SessionFrame> {
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         assert_eq!(y.len(), w * h, "luma plane size");
-        assert_eq!(u.len(), w * h / 4, "cb plane size");
-        assert_eq!(v.len(), w * h / 4, "cr plane size");
+        let chroma_len = if self.cfg.monochrome { 0 } else { w * h / 4 };
+        assert_eq!(u.len(), chroma_len, "cb plane size");
+        assert_eq!(v.len(), chroma_len, "cr plane size");
+        if self.geom.is_padded() {
+            // §7.4.2.1.1 — code the padded grid; the SPS crops it back.
+            let (cw, ch) = (
+                self.geom.coded_width as usize,
+                self.geom.coded_height as usize,
+            );
+            let py = self.geom.pad_plane(y, w, h, cw, ch);
+            let pad_c = |p: &[u8]| {
+                if p.is_empty() {
+                    Vec::new()
+                } else {
+                    self.geom.pad_plane(p, w / 2, h / 2, cw / 2, ch / 2)
+                }
+            };
+            let (pu, pv) = (pad_c(u), pad_c(v));
+            return self.push_coded_frame(&py, &pu, &pv);
+        }
+        self.push_coded_frame(y, u, v)
+    }
 
+    /// [`push_frame`](Self::push_frame) on planes of the coded grid.
+    fn push_coded_frame(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Vec<SessionFrame> {
         let d = self.idx;
         self.idx += 1;
         let mut out = Vec::new();
@@ -515,8 +611,8 @@ impl EncoderSession {
             self.dec_in_gop = 0;
             self.next_ref_frame_num = 0;
             let frame = YuvFrame {
-                width: self.cfg.width,
-                height: self.cfg.height,
+                width: self.geom.coded_width,
+                height: self.geom.coded_height,
                 y,
                 u,
                 v,
@@ -526,8 +622,8 @@ impl EncoderSession {
             out.push(sf);
         } else if self.cfg.b_frames == 0 {
             let frame = YuvFrame {
-                width: self.cfg.width,
-                height: self.cfg.height,
+                width: self.geom.coded_width,
+                height: self.geom.coded_height,
                 y,
                 u,
                 v,
@@ -573,13 +669,13 @@ impl EncoderSession {
         let anchor = pend.pop().expect("encode_minigop needs pending frames");
         let mut out = Vec::with_capacity(pend.len() + 1);
 
-        let frame = anchor.as_yuv(self.cfg.width, self.cfg.height);
+        let frame = anchor.as_yuv(self.geom.coded_width, self.geom.coded_height);
         let (sf, pic) = self.encode_au(&frame, SessionFrameKind::P, anchor.display_idx, None);
         out.push(sf);
         let anchor_pic = pic.expect("anchor encode returns a reference picture");
 
         for b in &pend {
-            let frame = b.as_yuv(self.cfg.width, self.cfg.height);
+            let frame = b.as_yuv(self.geom.coded_width, self.geom.coded_height);
             let (sf, _) = self.encode_au(
                 &frame,
                 SessionFrameKind::B,
@@ -713,7 +809,10 @@ impl EncoderSession {
                 // MB-row modulation toward the controller's soft
                 // target: anchors since rounds 420/430, B pictures
                 // since round 443.
-                let row_budget = Some(plan.target_bits.max(1.0) as u64);
+                // The macroblock-row QP modulation is a 4:2:0 path; a
+                // monochrome session steers by the per-picture QP and
+                // the VBV retry alone.
+                let row_budget = (!self.cfg.monochrome).then_some(plan.target_bits.max(1.0) as u64);
                 let mut qp = plan.qp;
                 let mut pic = self.encode_pic(frame, kind, frame_num, poc_lsb, qp, row_budget, l1);
                 // VBV hard-cap retry: the stateless encoder makes

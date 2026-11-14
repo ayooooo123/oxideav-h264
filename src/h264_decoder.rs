@@ -64,6 +64,7 @@ use crate::poc::{derive_poc, PocResult, PocSlice, PocSps, PocState};
 use crate::recovery::{MarkedPicture, Recovery};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
+use crate::sample_plane::{Samples, SamplesRef};
 use crate::slice_header::{
     MmcoOp as SliceMmcoOp, RefPicListModificationOp as SliceRplmOp, SliceHeader, SliceType,
 };
@@ -95,14 +96,21 @@ struct SdInput {
     pps: crate::pps::Pps,
 }
 
-type SdResult = std::result::Result<slice_data::SliceData, String>;
+/// The parsed slice data, with the slice's decoding-order checks when
+/// it may decode under frame threading ([`reconstruct::FtPrecheck`]).
+type SdResult =
+    std::result::Result<(slice_data::SliceData, Option<reconstruct::FtPrecheck>), String>;
 
 /// A slice-data parse queued on the pool when its NAL unit arrived.
 type SdTask = Deferred<SdInput, SdResult>;
 
 fn parse_sd(i: SdInput) -> SdResult {
-    slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
-        .map_err(|e| e.to_string())
+    let sd =
+        slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
+            .map_err(|e| e.to_string())?;
+    let pre = reconstruct::ft_precheck_applies(&i.header, &i.sps, &i.pps)
+        .then(|| reconstruct::ft_precheck(&sd, &i.header, &i.sps, &i.pps));
+    Ok((sd, pre))
 }
 
 /// An input event held back so the slice-data parses of the next few
@@ -123,6 +131,8 @@ struct FtState {
     slots: HashMap<u32, Arc<SharedPlanes>>,
     /// Pictures whose sample stage is queued or running, oldest first.
     inflight: VecDeque<Arc<SharedPlanes>>,
+    /// Bumped as each picture job ends.
+    finished: Arc<crate::frame_thread::JobsFinished>,
 }
 
 /// A picture decoded under frame threading: the slices whose decoding
@@ -130,6 +140,9 @@ struct FtState {
 #[derive(Default)]
 struct FtPicture {
     works: Vec<FtSliceWork>,
+    /// Per-macroblock refIdxL0 / refIdxL1 (per 8x8) the decoding-order
+    /// checks of deferred inter macroblocks track.
+    refs: Vec<[[i8; 4]; 2]>,
 }
 
 /// §7.4.1.2 / §7.4.1.2.4 — state carried forward across slices that
@@ -529,6 +542,10 @@ pub struct H264CodecDecoder {
     /// `Decoder::output_params_generation` — bumped when a returned
     /// frame's description differs from the previous frame's.
     params_generation: u64,
+    /// The first frame of a new shape, held back for one
+    /// `receive_frame` call while the `Frame::StreamParams` event
+    /// announcing its shape is returned in front of it.
+    held_frame: Option<VideoFrame>,
 }
 
 impl H264CodecDecoder {
@@ -576,6 +593,7 @@ impl H264CodecDecoder {
             extradata_nals: Vec::new(),
             emitted_shape: None,
             params_generation: 0,
+            held_frame: None,
         }
     }
 
@@ -1573,12 +1591,13 @@ impl H264CodecDecoder {
         // The slice-data parse queued when the NAL unit arrived (frame
         // threading) is the same §7.3.4 parse of the same inputs.
         let queued = self.pending_sd.take();
-        let sd = match (&dp, queued) {
+        let (sd, precheck) = match (&dp, queued) {
             (None, Some(task)) => task
                 .take()
                 .unwrap_or_else(|| Err("slice data parser panicked".to_string())),
             (None, None) => {
                 slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
+                    .map(|sd| (sd, None))
                     .map_err(|e| e.to_string())
             }
             (Some((b, c)), _) => slice_data::parse_slice_data_partitioned(
@@ -1591,6 +1610,7 @@ impl H264CodecDecoder {
                 sps,
                 pps,
             )
+            .map(|sd| (sd, None))
             .map_err(|e| e.to_string()),
         }
         .map_err(|e| Error::invalid(format!("h264 slice_data: {e}")))?;
@@ -2034,6 +2054,23 @@ impl H264CodecDecoder {
             in_progress.pic.ref_list_1_unit_keys = l1_unit_keys.clone();
         }
         let _ = list_1_pocs;
+        // Frame threading — the §8.4.1 motion of P and spatial-direct B
+        // slices is derived on the pool; a temporal-direct B slice
+        // derives it here, from the co-located picture's motion (which
+        // the pool derives for its own pictures).
+        let defer_motion =
+            ft_slice && (header.slice_type != SliceType::B || header.direct_spatial_mv_pred_flag);
+        if ft_slice
+            && !defer_motion
+            && let (Some(&key), Some(ft)) = (list1.first(), self.ft.as_ref())
+            && let Some(planes) = ft.slots.get(&key)
+            && let Some(m) = planes.wait_motion()
+            && let Some(shell) = self.ref_store.get_by_key(key)
+        {
+            let mut p = shell.clone();
+            p.set_motion(&m);
+            self.ref_store.insert(key, p);
+        }
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
             list_0: &list0,
@@ -2063,15 +2100,35 @@ impl H264CodecDecoder {
         let recon = if ft_slice {
             // Frame threading — the decoding-order part now; the sample
             // stage later, on the pool, with owned reference handles.
-            let (plan, res) = reconstruct::ft_motion_pass(
-                &sd,
-                header,
-                sps,
-                pps,
-                &provider,
-                &mut in_progress.pic,
-                &mut in_progress.grid,
-            );
+            let (plan, res) = match precheck {
+                // The checks ran with the parse; complete them here.
+                Some(pre) if defer_motion => {
+                    pre.finish(header, sps, &provider, &mut in_progress.grid)
+                }
+                _ => {
+                    let ftp = in_progress.ft.as_mut().expect("frame-threaded picture");
+                    if ftp.refs.len() != in_progress.grid.info.len() {
+                        ftp.refs = vec![[[-1; 4]; 2]; in_progress.grid.info.len()];
+                    }
+                    let cat = sps.chroma_array_type();
+                    let mut check = |list: u8, idx: u32, _mb: usize| {
+                        reconstruct::ft_validate_ref(&provider, list, idx, cat)
+                    };
+                    reconstruct::ft_motion_pass(
+                        &sd,
+                        header,
+                        sps,
+                        pps,
+                        &provider,
+                        &mut in_progress.pic,
+                        &mut in_progress.grid,
+                        defer_motion.then_some(reconstruct::FtDefer {
+                            refs: &mut ftp.refs[..],
+                            check_ref: &mut check,
+                        }),
+                    )
+                }
+            };
             let ft = self.ft.as_ref().expect("frame threading active");
             let refs = ft_provider(provider, &self.ref_store, &ft.slots);
             let mb_field_decoding_flags = sd.mb_field_decoding_flags.clone();
@@ -2302,7 +2359,11 @@ impl H264CodecDecoder {
         // decoded MV grid into the Picture so `ref_store` carries it
         // forward. Idempotent: overwrites whatever was in the Picture
         // before.
-        snapshot_grid_into_picture(&mut pic, &grid);
+        // (A frame-threaded picture's motion is derived and published
+        // by its pool job.)
+        if ft.is_none() {
+            snapshot_grid_into_picture(&mut pic, &grid);
+        }
         pic.gray = gray;
 
         // Frame threading — the decoder keeps the picture's metadata and
@@ -2324,6 +2385,11 @@ impl H264CodecDecoder {
                 samples.height_in_samples = pic.height_in_samples;
                 samples.pic_order_cnt = pic.pic_order_cnt;
                 samples.frame_num = pic.frame_num;
+                // What the §8.4.1 derivation reads of the current picture.
+                samples.coding_struct = pic.coding_struct;
+                samples.is_bottom_field = pic.is_bottom_field;
+                samples.top_field_order_cnt = pic.top_field_order_cnt;
+                samples.bottom_field_order_cnt = pic.bottom_field_order_cnt;
                 samples.luma = std::mem::take(&mut pic.luma);
                 samples.cb = std::mem::take(&mut pic.cb);
                 samples.cr = std::mem::take(&mut pic.cr);
@@ -2974,15 +3040,9 @@ fn gray_picture(
     );
     let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
     let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
-    for v in p.luma.iter_mut() {
-        *v = grey_y;
-    }
-    for v in p.cb.iter_mut() {
-        *v = grey_c;
-    }
-    for v in p.cr.iter_mut() {
-        *v = grey_c;
-    }
+    p.luma.fill(grey_y);
+    p.cb.fill(grey_c);
+    p.cr.fill(grey_c);
     p
 }
 
@@ -3151,8 +3211,23 @@ fn ft_provider(
         list_1_parities,
         list_0_focs,
         list_1_focs,
+        list_0_pocs,
+        list_0_longterm,
+        list_1_longterm,
+        list_0_unit_keys,
+        list_1_unit_keys,
+        list_0_pair_keys,
+        list_1_pair_keys,
         ..
     } = p;
+    let pairs = |keys: &[Option<(u32, u32)>]| -> Vec<Option<crate::frame_thread::FieldPair>> {
+        keys.iter()
+            .map(|k| {
+                let (t, b) = (*k)?;
+                Some((store.get_arc(t)?, store.get_arc(b)?))
+            })
+            .collect()
+    };
     let resolve = |keys: &[u32], overrides: Vec<Option<Picture>>| -> Vec<Option<FtRef>> {
         let mut overrides = overrides.into_iter();
         keys.iter()
@@ -3175,6 +3250,11 @@ fn ft_provider(
         ],
         parities: [list_0_parities, list_1_parities],
         focs: [list_0_focs, list_1_focs],
+        pocs_0: list_0_pocs,
+        longterm: [list_0_longterm, list_1_longterm],
+        keys: [list_0.to_vec(), list_1.to_vec()],
+        unit_keys: [list_0_unit_keys, list_1_unit_keys],
+        pair_fields: [pairs(&list_0_pair_keys), pairs(&list_1_pair_keys)],
     }
 }
 
@@ -3372,14 +3452,28 @@ impl Decoder for H264CodecDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(vf) = self.held_frame.take() {
+            return Ok(Frame::Video(vf));
+        }
         let (vf, shape) = self.receive_shaped()?;
         // The description changes together with the first frame of a
         // new shape (never at the header announcing it: pictures of
-        // the old shape may still have been queued for output).
-        if self.emitted_shape.is_some_and(|prev| prev != shape) {
-            self.params_generation = self.params_generation.wrapping_add(1);
-        }
+        // the old shape may still have been queued for output). Every
+        // picture carries the shape of the SPS it was decoded with, so
+        // the old-shape pictures still in the §C.4 reorder queue have
+        // all come out before this point, whatever the worker budget.
+        let changed = self.emitted_shape.is_some_and(|prev| prev != shape);
         self.emitted_shape = Some(shape);
+        if changed {
+            // Counter, answer and in-band event move together: the
+            // event is returned immediately before the frame, which is
+            // held for the next call.
+            self.params_generation = self.params_generation.wrapping_add(1);
+            self.held_frame = Some(vf);
+            return Ok(Frame::StreamParams(Box::new(
+                shape.to_params(&self.codec_id),
+            )));
+        }
         Ok(Frame::Video(vf))
     }
 
@@ -3543,6 +3637,7 @@ impl H264CodecDecoder {
                 queued_slices: 0,
                 slots: HashMap::new(),
                 inflight: VecDeque::new(),
+                finished: Arc::default(),
             });
         }
     }
@@ -3606,17 +3701,23 @@ impl H264CodecDecoder {
                 continue;
             };
             let mut full = shell.clone();
+            if let Some(m) = planes.wait_motion() {
+                full.set_motion(&m);
+            }
             let (luma, cb, cr) = planes.assemble();
             let n_l = (full.width_in_samples * full.height_in_samples) as usize;
             let n_c = (full.chroma_width() * full.chroma_height()) as usize;
-            if ok && luma.len() == n_l && cb.len() == n_c && cr.len() == n_c {
-                full.luma = luma;
-                full.cb = cb;
-                full.cr = cr;
+            let len_ok =
+                |p: &Option<Samples>, n: usize| p.as_ref().map_or(n == 0, |p| p.len() == n);
+            let (bd_y, bd_c) = (full.bit_depth_luma, full.bit_depth_chroma);
+            if ok && len_ok(&luma, n_l) && len_ok(&cb, n_c) && len_ok(&cr, n_c) {
+                full.luma = luma.unwrap_or_else(|| Samples::zeroed(0, bd_y));
+                full.cb = cb.unwrap_or_else(|| Samples::zeroed(0, bd_c));
+                full.cr = cr.unwrap_or_else(|| Samples::zeroed(0, bd_c));
             } else {
-                full.luma = vec![0; n_l];
-                full.cb = vec![0; n_c];
-                full.cr = vec![0; n_c];
+                full.luma = Samples::zeroed(n_l, bd_y);
+                full.cb = Samples::zeroed(n_c, bd_c);
+                full.cr = Samples::zeroed(n_c, bd_c);
             }
             self.ref_store.insert(key, full);
         }
@@ -3630,9 +3731,13 @@ impl H264CodecDecoder {
         let Some(ip) = self.in_progress.as_mut() else {
             return;
         };
-        let Some(ftp) = ip.ft.take() else {
+        let Some(mut ftp) = ip.ft.take() else {
             return;
         };
+        for w in ftp.works.iter_mut() {
+            w.refs.resolve_colocated_motion();
+        }
+        reconstruct::ft_motion_stage(&mut ftp.works, &ip.pic, &mut ip.grid);
         crate::frame_thread::run_pixels(&mut ip.pic, &mut ip.grid, &ftp.works, None, None);
         self.ft_materialize();
     }
@@ -3656,19 +3761,44 @@ impl H264CodecDecoder {
             planes.abort();
             return;
         };
-        // Bound the pictures in flight by the budget.
-        while ft.inflight.front().is_some_and(|p| p.is_done().is_some()) {
-            ft.inflight.pop_front();
-        }
-        while ft.inflight.len() >= ft.pool.threads() {
-            if let Some(p) = ft.inflight.pop_front() {
-                p.wait_done();
+        // Bound the pictures in flight by the budget (plus two queued,
+        // so a worker that finishes finds the next picture ready): wait
+        // for any of them to finish, helping with queued parses
+        // meanwhile.
+        loop {
+            let seen = ft.finished.get();
+            ft.inflight.retain(|p| p.is_done().is_none());
+            if ft.inflight.len() < ft.pool.threads() + 2 {
+                break;
+            }
+            if !ft.pool.help_one() {
+                ft.finished.wait_past(seen);
             }
         }
         ft.inflight.push_back(planes.clone());
+        let finished = ft.finished.clone();
         ft.pool.spawn_low(move || {
             let job_planes = planes.clone();
+            let mut ftp = ftp;
+            // However the job ends, it frees its slot.
+            struct Done(Arc<crate::frame_thread::JobsFinished>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.bump();
+                }
+            }
+            let _done = Done(finished);
             crate::frame_thread::run_job(&job_planes, move || {
+                // §8.4.1 — the deferred motion, published for the B
+                // slices that take this picture as co-located picture.
+                for w in ftp.works.iter_mut() {
+                    if !w.refs.resolve_colocated_motion() {
+                        planes.abort();
+                        return;
+                    }
+                }
+                reconstruct::ft_motion_stage(&mut ftp.works, &samples, &mut grid);
+                planes.set_motion(crate::picture::MotionGrids::from_grid(&grid));
                 let db = deblock.map(|(alpha_off, beta_off)| crate::frame_thread::FtDeblock {
                     alpha_off,
                     beta_off,
@@ -3791,6 +3921,10 @@ impl H264CodecDecoder {
         // already bumped but not yet consumed.
         self.output_dpb.reset();
         self.ready.clear();
+        // A new-shape frame held behind its already-returned event is
+        // stale too; the event's shape stays the reference the next
+        // frame is compared with (counter and answer already moved).
+        self.held_frame = None;
         self.pending_pts = None;
         self.ref_store = RefPicStore::new();
         self.dpb_entries.clear();
@@ -3826,32 +3960,7 @@ impl H264CodecDecoder {
 /// slice, but the per-picture cost of the copy is tiny and it keeps
 /// the code path uniform.
 fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
-    let w = grid.width_in_mbs as usize;
-    let h = grid.height_in_mbs as usize;
-    let nmb = w * h;
-    pic.mb_width_in_picture = grid.width_in_mbs;
-    pic.mv_l0_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.mv_l1_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.ref_idx_l0_grid = vec![-1i8; nmb * 4];
-    pic.ref_idx_l1_grid = vec![-1i8; nmb * 4];
-    pic.is_intra_grid = vec![false; nmb];
-    // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB, for
-    // AFRM pictures serving as colPic.
-    pic.mb_field_flags = vec![false; nmb];
-    for (addr, info) in grid.info.iter().enumerate() {
-        let base_mv = addr * 16;
-        let base_r = addr * 4;
-        for blk4 in 0..16 {
-            pic.mv_l0_grid[base_mv + blk4] = info.mv_l0[blk4];
-            pic.mv_l1_grid[base_mv + blk4] = info.mv_l1[blk4];
-        }
-        for blk8 in 0..4 {
-            pic.ref_idx_l0_grid[base_r + blk8] = info.ref_idx_l0[blk8];
-            pic.ref_idx_l1_grid[base_r + blk8] = info.ref_idx_l1[blk8];
-        }
-        pic.is_intra_grid[addr] = info.is_intra;
-        pic.mb_field_flags[addr] = info.mb_field_decoding_flag;
-    }
+    pic.set_motion(&crate::picture::MotionGrids::from_grid(grid));
 }
 
 /// §C.4.4 / §8.4.2 — re-interleave a complementary pair of half-height
@@ -3878,12 +3987,14 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
     // Luma: copy each field row into its parity-selected frame row.
     let wl = w as usize;
     for r in 0..field_h as usize {
-        let src = &top.luma[r * wl..r * wl + wl];
         let dst_row = 2 * r;
-        frame.luma[dst_row * wl..dst_row * wl + wl].copy_from_slice(src);
-        let src_b = &bottom.luma[r * wl..r * wl + wl];
+        frame
+            .luma
+            .copy_from(dst_row * wl, top.luma.slice(r * wl..r * wl + wl));
         let dst_row_b = 2 * r + 1;
-        frame.luma[dst_row_b * wl..dst_row_b * wl + wl].copy_from_slice(src_b);
+        frame
+            .luma
+            .copy_from(dst_row_b * wl, bottom.luma.slice(r * wl..r * wl + wl));
     }
 
     // Chroma: same interleave on each chroma plane.
@@ -3893,12 +4004,13 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
         for r in 0..cfh {
             let dst_row = 2 * r;
             let dst_row_b = 2 * r + 1;
-            frame.cb[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cb[r * cw..r * cw + cw]);
-            frame.cb[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cb[r * cw..r * cw + cw]);
-            frame.cr[dst_row * cw..dst_row * cw + cw].copy_from_slice(&top.cr[r * cw..r * cw + cw]);
-            frame.cr[dst_row_b * cw..dst_row_b * cw + cw]
-                .copy_from_slice(&bottom.cr[r * cw..r * cw + cw]);
+            let row = r * cw..r * cw + cw;
+            frame.cb.copy_from(dst_row * cw, top.cb.slice(row.clone()));
+            frame
+                .cb
+                .copy_from(dst_row_b * cw, bottom.cb.slice(row.clone()));
+            frame.cr.copy_from(dst_row * cw, top.cr.slice(row.clone()));
+            frame.cr.copy_from(dst_row_b * cw, bottom.cr.slice(row));
         }
     }
 
@@ -3962,7 +4074,7 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
     // whose row stride is `src_stride` samples.
     #[allow(clippy::too_many_arguments)]
     fn pack(
-        src: &[i32],
+        src: &Samples,
         src_stride: usize,
         x0: usize,
         y0: usize,
@@ -3971,15 +4083,43 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
         wide: bool,
         max: i32,
     ) -> Vec<u8> {
+        let stride = src_stride.max(1);
+        let rows = src.len() / stride;
+        let x1 = (x0 + rect_w).min(stride);
+        let x0 = x0.min(x1);
+        let row_range = |r: usize| r * stride + x0..r * stride + x1;
+        let rows_out = rows.saturating_sub(y0).min(rect_h);
         let mut out = Vec::with_capacity(rect_w * rect_h * if wide { 2 } else { 1 });
-        for row in src.chunks(src_stride.max(1)).skip(y0).take(rect_h) {
-            let row = &row[x0.min(row.len())..(x0 + rect_w).min(row.len())];
-            if wide {
-                for &s in row {
-                    out.extend_from_slice(&(s.clamp(0, max) as u16).to_le_bytes());
+        match src.as_ref() {
+            // An 8-bit plane stores its output bytes already: whole
+            // rows when the window spans the stride.
+            SamplesRef::U8(v) if !wide => {
+                if x0 == 0 && x1 == stride {
+                    out.extend_from_slice(&v[y0 * stride..(y0 + rows_out) * stride]);
+                } else {
+                    for r in y0..y0 + rows_out {
+                        out.extend_from_slice(&v[row_range(r)]);
+                    }
                 }
-            } else {
-                out.extend(row.iter().map(|&s| s.clamp(0, 255) as u8));
+            }
+            SamplesRef::U8(v) => {
+                for r in y0..y0 + rows_out {
+                    for &s in &v[row_range(r)] {
+                        out.extend_from_slice(&((s as i32).min(max) as u16).to_le_bytes());
+                    }
+                }
+            }
+            SamplesRef::U16(v) => {
+                for r in y0..y0 + rows_out {
+                    let row = &v[row_range(r)];
+                    if wide {
+                        for &s in row {
+                            out.extend_from_slice(&((s as i32).min(max) as u16).to_le_bytes());
+                        }
+                    } else {
+                        out.extend(row.iter().map(|&s| s.min(255) as u8));
+                    }
+                }
             }
         }
         out
@@ -5300,15 +5440,9 @@ mod tests {
     /// given POC + frame_num stamped on.
     fn field_pic(w: u32, field_h: u32, fill: i32, cfill: i32, poc: i32, frame_num: u32) -> Picture {
         let mut p = Picture::new(w, field_h, 1, 8, 8);
-        for s in p.luma.iter_mut() {
-            *s = fill;
-        }
-        for s in p.cb.iter_mut() {
-            *s = cfill;
-        }
-        for s in p.cr.iter_mut() {
-            *s = cfill;
-        }
+        p.luma.fill(fill);
+        p.cb.fill(cfill);
+        p.cr.fill(cfill);
         p.pic_order_cnt = poc;
         p.frame_num = frame_num;
         p
@@ -5357,7 +5491,7 @@ mod tests {
         for r in 0..(field_h * 2) as usize {
             let expect = if r % 2 == 0 { 10 } else { 20 };
             for c in 0..wl {
-                assert_eq!(frame.luma[r * wl + c], expect, "luma row {r}");
+                assert_eq!(frame.luma.get(r * wl + c), expect, "luma row {r}");
             }
         }
         // Chroma: 4:2:0 → half-width, half field height; interleave on
@@ -5367,8 +5501,8 @@ mod tests {
         for r in 0..(cfh * 2) {
             let expect = if r % 2 == 0 { 110 } else { 120 };
             for c in 0..cw {
-                assert_eq!(frame.cb[r * cw + c], expect, "cb row {r}");
-                assert_eq!(frame.cr[r * cw + c], expect, "cr row {r}");
+                assert_eq!(frame.cb.get(r * cw + c), expect, "cb row {r}");
+                assert_eq!(frame.cr.get(r * cw + c), expect, "cr row {r}");
             }
         }
         // §8.2.1 eq. 8-1 — frame POC = min(top, bottom) field POC.
@@ -5454,15 +5588,10 @@ mod tests {
     #[test]
     fn output_frame_is_the_cropping_rectangle() {
         let mut pic = Picture::new(32, 32, 1, 8, 8);
-        for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = ((i % 32) + 4 * (i / 32)) as i32;
-        }
-        for (i, s) in pic.cb.iter_mut().enumerate() {
-            *s = ((i % 16) + 16 * (i / 16)) as i32;
-        }
-        for (i, s) in pic.cr.iter_mut().enumerate() {
-            *s = 255 - ((i % 16) + 16 * (i / 16)) as i32;
-        }
+        pic.luma.fill_with(|i| ((i % 32) + 4 * (i / 32)) as i32);
+        pic.cb.fill_with(|i| ((i % 16) + 16 * (i / 16)) as i32);
+        pic.cr
+            .fill_with(|i| 255 - ((i % 16) + 16 * (i / 16)) as i32);
         let crop = FrameCropMargins {
             left: 2,
             right: 4,
@@ -5499,9 +5628,7 @@ mod tests {
     #[test]
     fn cropping_keeps_wide_samples_little_endian() {
         let mut pic = Picture::new(16, 16, 0, 10, 10);
-        for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = (i as i32) * 4;
-        }
+        pic.luma.fill_with(|i| (i as i32) * 4);
         let crop = FrameCropMargins {
             left: 0,
             right: 6,
@@ -5556,22 +5683,39 @@ mod tests {
         dec.flush_pending_field();
         dec.eof = true;
         let mut sizes = Vec::new();
-        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            let size = (
-                vf.planes[0].stride,
-                vf.planes[0].data.len() / vf.planes[0].stride,
-            );
-            // The decoder reports the visible size of the frame it just
-            // returned.
-            assert_eq!(
-                dec.output_video_dimensions(),
-                Some((size.0 as u32, size.1 as u32))
-            );
-            sizes.push(size);
-            assert_eq!(vf.planes[1].stride, 7);
+        let mut events = Vec::new();
+        while let Ok(f) = dec.receive_frame() {
+            match f {
+                Frame::Video(vf) => {
+                    let size = (
+                        vf.planes[0].stride,
+                        vf.planes[0].data.len() / vf.planes[0].stride,
+                    );
+                    // The decoder reports the visible size of the frame
+                    // it just returned.
+                    assert_eq!(
+                        dec.output_video_dimensions(),
+                        Some((size.0 as u32, size.1 as u32))
+                    );
+                    sizes.push(size);
+                    assert_eq!(vf.planes[1].stride, 7);
+                }
+                Frame::StreamParams(p) => {
+                    events.push((p.width, p.height, sizes.len()));
+                    let now = dec.output_params().expect("answer");
+                    assert_eq!(
+                        (p.width, p.height, p.pixel_format),
+                        (now.width, now.height, now.pixel_format)
+                    );
+                }
+                _ => panic!("unexpected frame kind"),
+            }
         }
-        // Pair: 8 rows − 4; lone field: 4 rows − 2.
+        // Pair: 8 rows − 4; lone field: 4 rows − 2 — a new output
+        // shape, announced in band right before the lone field.
         assert_eq!(sizes, vec![(14, 4), (14, 2)]);
+        assert_eq!(events, vec![(Some(14), Some(2), 1)]);
+        assert_eq!(dec.output_params_generation(), 1);
     }
 
     /// Round 430 (2026-07-25 scheduled-fuzz OOM triage) — §8.2.5.2
@@ -5635,7 +5779,7 @@ mod tests {
         for e in &dec.dpb_entries {
             let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
             assert!(pic.gray, "nothing has recovered: the gap frames are gray");
-            assert!(pic.luma.iter().all(|&v| v == 128));
+            assert!(pic.luma.to_i32_vec().iter().all(|&v| v == 128));
         }
 
         // FFmpeg's single `prev_frame_num` also feeds POC types 1 and 2.

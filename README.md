@@ -32,6 +32,17 @@ process). Interlaced 1080i MBAFF streams with P and B pictures (TFF and
 BFF, B-pyramid, spatial and temporal direct, implicit weighted
 bi-prediction, CAVLC and CABAC, 4:2:2 and 10-bit) decode MD5-identical
 to a black-box reference decoder (`integration_mbaff_inter_conformance`).
+Decoding also starts without an IDR picture, as a broadcast stream joined
+mid-way requires: at a non-IDR I picture or at an access unit carrying a
+recovery point SEI message (intra refresh), references to pictures before
+the entry point are inferred as all-intra mid-grey pictures (D.2.8 NOTE 3)
+and pictures preceding the recovery point in output order (open-GOP
+leading B pictures, the refresh period) are decoded but not output; a
+lost reference picture (a frame_num jump the SPS does not allow) is
+concealed through the §8.2.5.2 gap process and decoding resynchronises at
+the next recovery point (`integration_random_access`; a 1920x1080 MBAFF
+open-GOP stream cut at a non-IDR I picture decodes byte-identical to the
+black-box reference decoder).
 §8.5.15 lossless transform-bypass
 (`qpprime_y_zero_transform_bypass_flag=1`, QP′Y == 0) decodes
 losslessly — identity §8.5.10..§8.5.13 legs + V/H intra residual DPCM
@@ -248,10 +259,26 @@ encoder accepts every layout the crate's High-family encoder codes:
 `Yuv420P` / `Yuv422P` / `Yuv444P` / `Gray8` at 8 bit and the
 `*P10Le` / `*P12Le` / `Gray10Le` / `Gray12Le` variants (declared on
 the registry descriptor so the Layer-2 gateway ladder sees them).
-8-bit 4:2:0 input (grey coded as 4:2:0 with constant chroma) keeps the
-Baseline / Main session — IDR / P / B, rate control, streams
-byte-identical to earlier releases (`integration_registry_bit_identity`
-pins them). Every other layout rides `encoder::deep::DeepSession`
+8-bit 4:2:0 input keeps the Baseline / Main session — IDR / P / B,
+rate control, streams byte-identical to earlier releases
+(`integration_registry_bit_identity` pins them). **Grey input is coded
+4:0:0** (`chroma_format_idc = 0`: luma only, no chroma syntax — round
+488): `Gray8` through the same session under High (100, the lowest
+profile with a monochrome format) with CAVLC or CABAC, B pictures and
+rate control (per-picture QP + VBV retry; the MB-row modulation is a
+4:2:0 path); `Gray10Le` / `Gray12Le`, and `Gray8` with a High-family
+tool or `profile=high`, through `encoder::deep` (High 100 / High 10 /
+High 4:4:4 Predictive for 12 bit and lossless). The output layout is
+the grey format itself; `profile=baseline` / `main` keep the earlier
+carriage of `Gray8` as 4:2:0 with constant chroma. Measured (160x128
+synthetic, 3 intra pictures, QP 26): 4:0:0 19 706 B vs 19 959 B as
+4:2:0 under CAVLC (−1.3 %), 17 420 vs 17 436 B under CABAC; with P / B
+pictures the 4:0:0 mode decision is narrower than the 4:2:0 one (the
+CAVLC P path offers P_8x8 and the Intra_16x16 fallback at 4:2:0 only;
+enabling the fallback alone at 4:0:0 was measured and gains nothing)
+and can come out larger (+6 % CAVLC P, +2.5 % CABAC B on the same
+content). Picture sizes need not be whole macroblocks on any path
+(§7.4.2.1.1 cropping — see the coding-tool table). Every other layout rides `encoder::deep::DeepSession`
 under the §A.2.4 – §A.2.7 minimum profile (High 100 / High 10 110 /
 High 4:2:2 122 / High 4:4:4 Predictive 244): IDR + P pictures
 (Intra_16x16, P_Skip / P_L0_16x16 / Intra_16x16 fallback), CAVLC or
@@ -285,10 +312,32 @@ both entropy coders, lossy and lossless; lossless 12-bit 4:4:4 shrinks
 3 pictures, CAVLC, bytes / min luma PSNR): 4:2:2 8-bit 3389 B / 45.2
 dB at QP 20, 2009 B / 38.4 dB at QP 28, 1048 B / 30.8 dB at QP 36;
 4:2:0 10-bit 2429 / 45.6, 1479 / 38.2, 858 / 30.9; 4:4:4 12-bit 4970 /
-45.7, 3009 / 38.1, 1492 / 30.9. Not yet on this path: 4:0:0
-(`chroma_format_idc = 0`) coding for grey input, Intra_8x8 and
-Intra_NxN inside P pictures at > 8 bit, B pictures and rate control
-for the High-family layouts.
+45.7, 3009 / 38.1, 1492 / 30.9. **4:0:0** (round 488):
+`chroma_format_idc = 0` at 8..=14 bit on this path — luma-only
+Intra_16x16 / Intra_4x4 / P_Skip / P_L0_16x16 (4x4 or 8x8 transform),
+CAVLC (`coded_block_pattern` through the Table 9-4 ChromaArrayType 0 / 3
+column) and CABAC (no chroma CBP bins, no `intra_chroma_pred_mode`),
+lossless included. **Intra_8x8 at 8..=14 bit** (round 488,
+`transform_8x8` + `intra_8x8`, default on; `DeepSession::with_intra_8x8`):
+§8.3.2 prediction from the §8.3.2.2.1 filtered reference samples on the
+block-sequential reconstruction, §8.3.2.1 predicted-mode coding against
+Intra_4x4 / Intra_8x8 / Intra_16x16 / inter neighbours, the 8x8 residual
+at QP′ (or the §8.5.15 V / H DPCM under transform bypass), CAVLC
+(§7.4.5.3.3 four-4x4 split) and CABAC (ctxBlockCat 5), at 4:0:0 / 4:2:0
+/ 4:2:2, competing with Intra_16x16 and Intra_4x4 per macroblock on
+`Σ (SAD + mode bits · λ)`. **Intra_4x4 and Intra_8x8 inside P
+pictures** (round 488; `intra_in_p`, ChromaArrayType 0 / 1 / 2): the
+cheapest of the three intra predictions is the alternative to the
+inter macroblock (Table 7-13 `mb_type` 5 for I_NxN). `integration_deep_intra8x8`:
+11 layouts (4:2:0 / 4:2:2 / 4:0:0 at 8 / 10 / 12 / 14 bit) x CAVLC /
+CABAC x I-only / IPP, lossless, cropped sizes, QP 10..46 — bit-exact
+in our decoder and byte-exact in a black-box decoder. Measured (96x48
+synthetic with 8-sample structure, 3 I pictures, 4:2:0 8-bit CAVLC,
+bytes / luma PSNR with vs without the Intra_8x8 candidate): QP 22
+6447 / 40.16 vs 6454 / 40.41, QP 30 4293 / 33.30 vs 4323 / 33.30, QP 38
+2296 / 26.08 vs 2314 / 25.97 — 4..13 of 54 macroblocks pick it. Not yet on this
+path: I_NxN inside P pictures at 4:4:4, Intra_8x8 at 4:4:4, B pictures
+and rate control for the High-family layouts.
 
 | Coding tool | Scope | Notes |
 | ----------- | ----- | ----- |
@@ -303,7 +352,7 @@ for the High-family layouts.
 | **10 / 12 / 14-bit (r456 `encoder::deep`)** | High 10 (110), High 4:2:2 (122), High 4:4:4 Predictive (244) — `u16` sources at 4:2:0 / 4:2:2 / 4:4:4, CAVLC **and CABAC** I (Intra_16x16) + P (P_Skip / P_L0_16x16 / Intra_16x16 fallback), 8x8 transform (4:2:0 / 4:2:2), deblocking, **lossless** `qpprime_y_zero_transform_bypass` | §7.4.2.1.1 `bit_depth_luma_minus8`, §8.5.8 eq. 8-309 QP_Y (now `52 + 2*QpBdOffsetY` addend — round 349 fixed the >8-bit-only off-by-`QpBdOffsetY` bug that collapsed the dequant scale), §8.5.12 dequant at qP'=qP+`QpBdOffsetY`(=12), `1<<(bd-1)=512` predicted DC default, LE-u16 `yuv420p10le` plane packing — all wired end-to-end (`corpus_10_bit_high10_emits_full_range`: every sample legal 10-bit `0..1023`, luma genuinely spans the >8-bit range; `reconstruct::next_qp_y` spec-value tests at 8/10/12-bit). Round 410: the `10-bit-high10` fixture reference was regenerated (the old file was 50% conceal-fill) and the whole picture gates **byte-exact**, as do the new 5-frame `10-bit-high10-inter` (I/P/B), `10-bit-high422` and `10-bit-high444` GOP fixtures — the residual "right-column divergence" was the defective reference, not the decoder. The 10-bit 4:2:2 path needed one real fix: §8.5.11.2 eq. 8-328 chroma-DC dequant used qP where the spec says qPDC. **r451 — 12-/14-bit decode gated**: the SPS writer emits caller-selected bit depths and `integration_high_bit_depth` builds its own streams (all-I_PCM pictures — exact LE-u16 sample round-trips at ranges beyond the 10-bit ceiling — and Intra_16x16 DC pictures with coded luma/chroma DC residual through §8.5.10/§8.5.11/§8.5.12 at qP′ = 36/50), byte-exact against the black-box reference decoder at BOTH depths **r456 — the high-bit-depth ENCODER**: every stage runs the decoder's bit-depth-aware processes (QP′ = QP + QpBdOffset forward/inverse scaling extended past 51, §8.5.8 chroma QP with the −QpBdOffsetC clip, `1 << (BitDepth − 1)` intra DC defaults, Clip1 at depth, §8.4.2.2 interpolation at depth, §8.7 deblocking with α/β/tC0 scaled by `1 << (BitDepth − 8)`), QP_Y down to −QpBdOffsetY; **lossless** coding (SPS bypass flag at QP′Y == 0: §8.5.10/§8.5.11/§8.5.12 identities + §8.5.15 V/H DPCM on luma, chroma and 4:4:4 planes) reconstructs the source sample-for-sample (`lossless_interop` withholds the DPCM-triggering V/H modes: the black-box reference decoder skips the §8.5.2 step 3 / §8.5.4 step 3 Intra_16x16 + chroma DPCM — DC/Plane agree, V/H disagree, V/H agree once the DPCM is withheld — while our decoder is spec-literal). 14 gates (10/12/14-bit × 4:2:0/4:2:2/4:4:4 × CAVLC/CABAC, 8x8 transform, negative QP, lossless at 8..=14-bit) bit-exact in our decoder + byte-exact in the black-box reference decoder + PSNR-checked vs the source. A real defect fell out: the shared 4:2:2 chroma DC quantiser ran at qP instead of eq. 8-327's qP,DC = qP + 3 (every 4:2:2 stream since r27 carried chroma ~10 dB below luma; fixed, 30 → 42 dB), and the decoder's CABAC `coeff_abs_level_minus1` escape cap (14 leading ones, 8-bit-sized) rejected legal 12-/14-bit levels up to 2^21 — now 20. Fuzz: `mbaff_cabac_roundtrip` + `deep_roundtrip` round-trip targets |
 | Intra fallback in P / B | Intra_16x16 | Per-MB Lagrangian RDO against the inter winner (`EncoderConfig::intra_in_inter`); a 4:2:0-only mode choice (I_NxN / I_PCM fallback deferred) |
 | Trellis quantisation (RDOQ) | §9.3.3.1.3 + §8.5.12 | CABAC paths. Default: the spatial-domain `D + λ·R` one-step-toward-zero lite pass on inter luma 4×4 (`EncoderConfig::trellis_quant`, opt-in on Intra_16x16 luma + chroma AC). **Full trellis (r453, `EncoderConfig::trellis_full`, opt-in)**: Viterbi over every last-significant position and {0, \|q\|−1, \|q\|} per coefficient with the eq. 9-23/9-24 `numDecodAbsLevelEq1/Gt1` context state, bin costs from the §9.3.1.1 initial states + Table 9-44 probabilities, sample-domain re-check against open-loop and lite. Measured (textured-motion P+B, QP 20..=36): P+B payload −1.1 % at ≤ 0.1 dB, QP-32 P slice −8 %; one QP-34 B slice grew 4 bytes vs open-loop, so lite stays default. Informative only — bitstream syntax unchanged |
-| **8x8 transform (High profile)** | `EncoderConfig::transform_8x8` — CAVLC **and CABAC** I/P/B at every chroma format (r397 closed the CAVLC 4:2:2/4:4:4 inter legs) | §8.6.4 forward 8x8 transform + §8.5.13.1 quantiser (`MF8x8 = round(2^18 / normAdjust8x8)` at `qBits8 = 22 + qP/6`), Table 8-14 8x8 zig-zag, §7.4.5.3.3 four-4x4 CAVLC split. SPS auto-promotes to High (100); PPS codes the §7.3.2.2 tail (`transform_8x8_mode_flag = 1`). **Intra**: per-MB 3-way RDO (I_16x16 / I_4x4 / I_8x8 — all 9 §8.3.2 Intra_8x8 modes with the §8.3.2.1 eq. 8-73 pred-mode derivation mirrored encoder-side). **Inter**: per-MB 8x8-vs-4x4 luma-residual trial on P_L0_16x16 and every coded B shape; the §7.3.5 second-gate flag is coded on all qualifying writers. §8.7 deblock mirrors the 8x8 internal-edge skip. **CABAC (r385)**: `encode_idr_cabac` trials Intra_8x8 (§9.3.3.1.1.10 `transform_size_8x8_flag` at ctxIdxOffset 399 + §7.3.5.3.3 blockCat-5 64-coefficient residuals, Table 9-43 significance maps, CBF suppressed at 4:2:0); `encode_p_cabac` / `encode_b_cabac` code the second-gate flag on every coded MB with `cbp_luma > 0` and emit blockCat-5 residuals when the 8x8 trial wins. **4:2:2 (r385)**: the 3-way RDO runs at High 4:2:2 (profile 122, `write_i8x8_mb_chroma` + the mandatory I_NxN zero-flag). **4:4:4 (r385)**: all-Intra_8x8 IDR with §8.3.4.5 chroma-coded-like-luma 8x8 (per-plane §9.2.1.1 nC via `derive_nc_plane_luma_like`); a decoder fix landed alongside — the CAVLC 4:4:4 8x8 Cb/Cr plane residual is now §7.4.5.3.3-interleaved at parse (previously scrambled). All paths bit-exact self-roundtrip + black-box reference-decoder interop (`integration_i8x8_encoder.rs` 12 gates + `integration_i8x8_cabac.rs` 6 gates). **r388**: CABAC 4:2:2 IDR (8-coefficient ChromaDCLevel under the eq. (9-22) NumC8x8=2 contexts, 2x4 chroma-AC grid, transform_8x8 allowed) and CABAC 4:4:4 Intra_8x8 (blockCat-9/13 chroma residuals, explicit cat-5/9/13 `coded_block_flag` with the §9.3.3.1.1.9 neighbouring-8x8-block cond terms) landed, plus the **4:4:4 I_16x16-vs-Intra_8x8 RDO** (CAVLC: two-way trial with 3-plane SSD + real bits; CABAC: luma-cost trial) with real per-plane nC on the mixed-shape streams. **r391**: the 4:4:4 **I_4x4 leg** landed — the CAVLC 4:4:4 IDR trial is now two-way I_16x16 / Intra_4x4 (three-way + Intra_8x8 under `transform_8x8`); §8.3.4.5 chroma-as-luma 4x4 emit with per-plane §9.2.1.1 nC, both transform-size flag values in one stream, dual-decoder bit-exact (`integration_i4x4_444_encoder.rs`) |
+| **8x8 transform (High profile)** | `EncoderConfig::transform_8x8` — CAVLC **and CABAC** I/P/B at every chroma format (r397 closed the CAVLC 4:2:2/4:4:4 inter legs) | §8.6.4 forward 8x8 transform + §8.5.13.1 quantiser (`MF8x8 = round(2^18 / normAdjust8x8 · 64 / (p_i · p_j))` at `qBits8 = 22 + qP/6`, `p` the squared norm of the inverse basis row — 8, 289/32 or 5; round 488 added the `64 / (p_i · p_j)` class factor, without which rows / columns 2 and 6 were coded at 39 %..71 % of their value), Table 8-14 8x8 zig-zag, §7.4.5.3.3 four-4x4 CAVLC split. SPS auto-promotes to High (100); PPS codes the §7.3.2.2 tail (`transform_8x8_mode_flag = 1`). **Intra**: per-MB 3-way RDO (I_16x16 / I_4x4 / I_8x8 — all 9 §8.3.2 Intra_8x8 modes with the §8.3.2.1 eq. 8-73 pred-mode derivation mirrored encoder-side). **Inter**: per-MB 8x8-vs-4x4 luma-residual trial on P_L0_16x16 and every coded B shape; the §7.3.5 second-gate flag is coded on all qualifying writers. §8.7 deblock mirrors the 8x8 internal-edge skip. **CABAC (r385)**: `encode_idr_cabac` trials Intra_8x8 (§9.3.3.1.1.10 `transform_size_8x8_flag` at ctxIdxOffset 399 + §7.3.5.3.3 blockCat-5 64-coefficient residuals, Table 9-43 significance maps, CBF suppressed at 4:2:0); `encode_p_cabac` / `encode_b_cabac` code the second-gate flag on every coded MB with `cbp_luma > 0` and emit blockCat-5 residuals when the 8x8 trial wins. **4:2:2 (r385)**: the 3-way RDO runs at High 4:2:2 (profile 122, `write_i8x8_mb_chroma` + the mandatory I_NxN zero-flag). **4:4:4 (r385)**: all-Intra_8x8 IDR with §8.3.4.5 chroma-coded-like-luma 8x8 (per-plane §9.2.1.1 nC via `derive_nc_plane_luma_like`); a decoder fix landed alongside — the CAVLC 4:4:4 8x8 Cb/Cr plane residual is now §7.4.5.3.3-interleaved at parse (previously scrambled). All paths bit-exact self-roundtrip + black-box reference-decoder interop (`integration_i8x8_encoder.rs` 12 gates + `integration_i8x8_cabac.rs` 6 gates). **r388**: CABAC 4:2:2 IDR (8-coefficient ChromaDCLevel under the eq. (9-22) NumC8x8=2 contexts, 2x4 chroma-AC grid, transform_8x8 allowed) and CABAC 4:4:4 Intra_8x8 (blockCat-9/13 chroma residuals, explicit cat-5/9/13 `coded_block_flag` with the §9.3.3.1.1.9 neighbouring-8x8-block cond terms) landed, plus the **4:4:4 I_16x16-vs-Intra_8x8 RDO** (CAVLC: two-way trial with 3-plane SSD + real bits; CABAC: luma-cost trial) with real per-plane nC on the mixed-shape streams. **r391**: the 4:4:4 **I_4x4 leg** landed — the CAVLC 4:4:4 IDR trial is now two-way I_16x16 / Intra_4x4 (three-way + Intra_8x8 under `transform_8x8`); §8.3.4.5 chroma-as-luma 4x4 emit with per-plane §9.2.1.1 nC, both transform-size flag values in one stream, dual-decoder bit-exact (`integration_i4x4_444_encoder.rs`) |
 | **Scaling matrices (r388 + r391)** | `EncoderConfig::scaling_matrix` ∈ {Flat, SeqDefault, PicDefault, SeqCustom, PicCustom} — CAVLC + CABAC, I/P/B at 4:2:0 | §7.3.2.1.1.1 Table 7-3/7-4 **default** quantisation matrices signalled at sequence level (SPS `seq_scaling_matrix_present_flag`, every list UseDefaultScalingMatrixFlag via `delta_scale = -8`) or picture level (§7.3.2.2 PPS tail); the forward quantiser divides by the §8.5.9 weightScale (`_w` variants) and the local recon runs the decoder's scaled inverse across I_16x16 / I_4x4 / I_8x8. A decoder fix landed first: the §8.5.6 inverse zig-zag from scan-order scaling lists to raster weightScale was missing entirely, so every non-flat matrix (x264 `cqm=jvt` streams) previously dequantised garbled. Both directions pinned bit-exact against the black-box reference decoder (`integration_scaling_matrix.rs` 21 gates + 2 cqm-jvt decode gates). **r391**: non-flat matrices run on **P/B slices** (inter weightScale on the 4x4 + 8x8 inter luma and inter chroma quantisers; the intra-fallback MBs use the intra lists) and **under CABAC** (I/P/B at 4:2:0), and **custom user-supplied list values** are coded through the real §7.3.2.1.1.1 delta_scale chain (wrap-aware; SPS/PPS parse-back recovers the exact values) — `integration_scaling_matrix_pb.rs` (5 gates) + `integration_scaling_matrix_cabac.rs` (5 gates) |
 | **Chroma-AC CAVLC nC (r388 fix)** | all CAVLC writers (I/P/B, 4:2:0 + 4:2:2) | The historical `nC = 0` shortcut desynchronised every spec decoder on dense chroma (nC selects the §9.2.1.1 coeff_token *table*); the encoder now derives per-block chroma-AC nC from the `CavlcNcGrid` with in-MB progressive TotalCoeff commits (`integration_chroma_nc.rs`) |
 | **CABAC 4:2:2 / 4:4:4 P + B (r391)** | `encode_p_cabac` / `encode_b_cabac` at every chroma format | 4:2:2: §8.4.1.4 half-width/full-height chroma MC (`mvC.y = mvL.y·2` in 1/8-pel), §8.5.11.2 4x2-Hadamard inter chroma chain under the NumC8x8=2 contexts, §8.7 deblock at chroma_array_type=2. 4:4:4: chroma motion-compensated like luma (§8.4.2.2.1 6-tap per plane, mvC = mvL) and coded like luma — blockCat-8/12 full 4x4 inter residuals or blockCat-5/9/13 8x8 with explicitly coded CBF under `transform_8x8`, CBP quadrant bits merged across the three planes. r397 completed the B mode set at 4:2:2/4:4:4: B_Skip / B_Direct_16x16 (spatial §8.4.1.2.2, uniform gate) and the 16x8 / 8x16 partitions (Table 7-14 raw 4..=21, per-partition §8.4.1.3 mvps + §9.3.3.1.1.7 contexts); B_8x8 stays a 4:2:0-only mode choice. 9 GOP gates bit-exact through both decoders (`integration_cabac_pb_chroma_formats.rs`). A **decoder fix** landed first: twelve §9.3.1.1 Table 9-30/9-31/9-32 P/B-column (m, n) init values (ctxIdx 805/849, 975..980, 1005..1010 — the cat-6..8/10..12 coeff_abs_level families) were mis-transcribed, desynchronising every CABAC 4:4:4 P/B decode at the first inter chroma abs-level bin; the full 460..1023 range is now diffed against the spec table text and a 3-frame black-box 4:4:4 P stream pins it (`cabac_444_p_slices_reference_stream_decodes_bit_exact`) |
@@ -312,6 +361,7 @@ for the High-family layouts.
 | **Weighted prediction (r26 / r440 / r453)** | B explicit (`weighted_bipred_idc = 1`) + implicit (PAFF, idc 2); **P explicit (r453, `EncoderConfig::explicit_weighted_pred`)** | P: PPS `weighted_pred_flag = 1`, per-slice §7.3.3.2 `pred_weight_table()` (luma, `chroma_weight_l0_flag = 0`), §8.4.2.3.2 eq. 8-274 weighting of every inter predictor incl. P_Skip before the residual / skip decision, motion search on the weighted reference, slice-wide least-squares `(weight, offset)` at `logWD = 5` elected on ≥ 1 % co-located SSD gain (fade detection) else `luma_weight_l0_flag = 0`. Measured (five-frame global fade, QP 26): P payload 6684 → 960 bytes at equal PSNR (37.56 → 37.55 dB). 3 gates bit-exact in both decoders |
 | **Multi-reference + long-term references + MMCO + RPLM (r453)** | `encoder::multiref` — Baseline, CAVLC 4:2:0, up to 16 active references | §8.2.4.2.1 RefPicList0 (short-term by descending PicNum, long-term by ascending LongTermPicNum) mirrored from an encoder-side §8.2.5 buffer: sliding window, §7.4.3.3 `long_term_reference_flag` on the IDR, MMCO 4 + 6 long-term assignment of a P picture (with MMCO 1 eviction on overflow), MMCO 2 unmarking, RPLM `long_term_pic_num` splicing to index 0 — marking applied after the picture is coded; §7.3.3 `num_ref_idx_active_override`; per-MB quarter-pel election over every active reference. 4 gates (3 active refs electing the two-frames-back reference, long-term IDR anchor, MMCO mark + unmark, RPLM) bit-exact in both decoders |
 | **Multi-slice, FMO, ASO, redundant slices, constrained intra (r453)** | `encoder::slices` — Baseline, CAVLC 4:2:0 | §7.3.2.2 slice group map types 0..=6 in the PPS (`slice_group_change_cycle` in the headers for 3..=5), `MbToSliceGroupMap` derived with the decoder's §8.2.2 code, raster slices of `mbs_per_slice` MBs per group, per-slice neighbour-state restart + explicit §6.4.8 same-slice availability mask for the intra predictors (top / left / top-left individually), `constrained_intra_pred_flag = 1` dropping inter neighbours for the Intra_16x16 fallback in P slices, reverse-order slice emission (ASO), `redundant_pic_cnt = 1` re-encodes at QP + 6. 12 gates bit-exact in our decoder; the multi-slice / constrained-intra / slice-boundary streams also byte-exact in the black-box reference decoder (which lacks FMO and ASO and does not discard redundant slices) |
+| **Frame cropping (r488)** | every encoder path: `EncoderSession`, `encoder::deep`, the registry encoder, and the PAFF / MBAFF drivers | Any picture size on the §7.4.2.1.1 crop-unit grid (`CropUnitX` x `CropUnitY`: 2 x 2 at 4:2:0, 2 x 1 at 4:2:2, 1 x 1 at 4:4:4 / 4:0:0; `CropUnitY` doubles with `frame_mbs_only_flag = 0`) is coded on a grid padded to whole macroblocks (macroblock pairs for field / MBAFF coding) by repeating the last column and row (the last row of each field parity for interlaced coding), with `frame_cropping_flag = 1` and `frame_crop_right_offset` / `frame_crop_bottom_offset` in the SPS (`encoder::pad::CodedGeometry`). `EncoderConfig::crop_right` / `crop_bottom` for the stateless `Encoder`. `integration_frame_cropping`: 7 sizes x 4:2:0 (8 / 10 bit, Baseline / Main / High, B pictures, CBR), 5 x 4:2:2, 6 x 4:4:4 (down to 1 x 1), lossless, 6 sizes x PAFF I/P/B fields and x MBAFF CAVLC + CABAC under three pair policies — every stream outputs the requested size from our decoder and byte-identically from a black-box decoder |
 | **SEI writers (r430 / r453)** | `encoder::sei` | `buffering_period` + `pic_timing` (HRD rate-controlled sessions) and **`recovery_point` (r453, `SessionConfig::recovery_point_sei`)** on every IDR access unit (`recovery_frame_cnt = 0`, `exact_match_flag = 1`), round-tripped through the decoder's §D.1 parsers |
 
 ## Goals
@@ -365,23 +415,115 @@ framemd5 comparison:
 cargo run --release --example decode_bench -- clip.h264 8 [out.yuv]
 ```
 
+## Output shape and mid-stream changes
+
+The size, pixel format, frame rate and colour signal of the decoded
+frames are stated once per stream, by `Decoder::output_params()` —
+answered from the `avcC` record or the first SPS before any frame.
+When a new active SPS changes that shape (a new coded video sequence
+at another size, cropping, chroma format or bit depth), the change is
+announced three ways that agree: `output_params()` answers the new
+shape, `output_params_generation()` moves, and `receive_frame` returns
+one `Frame::StreamParams` event carrying the new answer immediately
+before the first frame of the new shape. Every frame of the old shape
+still in the reorder queue comes out before the event, at every worker
+budget, after `reset()` and while draining after `flush()`. Callers
+that do not care skip the event (`Frame::is_stream_params`);
+`receive_arena_frame` skips it for them.
+
+The registry encoder takes the same event as a re-configuration
+request (Annex B output only): it drains the old configuration and
+starts a new coded video sequence — IDR plus the new SPS / PPS — for
+the new shape. With `format=avcc`, or for a shape the encoder cannot
+code, it returns `Error::Unsupported`.
+
 ## Threading
 
 `Decoder::set_execution_context` with a budget above one turns on
 frame-level threading for frame pictures (no PAFF fields, no MBAFF,
-ChromaArrayType 0–2, no SP / SI slices or slice groups): slice data is
-parsed on a pool of `threads` workers as NAL units arrive, the calling
-thread runs the decoding-order work (POC, reference lists and marking,
-macroblock motion, output ordering), and each picture's sample
-reconstruction and deblocking runs on the pool, macroblock row by row,
-while later pictures that reference it start as soon as the rows their
-motion vectors reach are done. Other pictures decode serially (with the
-slice-level row threading of P / B slices and wavefront deblocking).
-The output is identical for every budget; `receive_frame` reports
-`NeedMore` while the next frame is still being reconstructed.
+ChromaArrayType 0–2, no SP / SI slices or slice groups). As NAL units
+arrive, each slice's data is parsed on a pool of `threads` workers
+together with the slice's decoding-order checks (partition structure,
+intra mode availability, the reference indices it uses), which only
+look at the slice's own macroblocks. The calling thread keeps the
+picture-level decoding order — POC, reference lists and marking, the
+check of the used reference indices against the lists, output
+ordering — and no per-macroblock work. Each picture then runs as one
+pool job: the §8.4.1 motion derivation of its P / spatial-direct B
+slices (published for the B pictures that take it as co-located
+picture; temporal-direct B slices derive theirs on the calling thread),
+then sample reconstruction and deblocking macroblock row by row, while
+later pictures that reference it start as soon as the rows their
+motion vectors reach are done. The calling thread runs queued parses
+while it waits for a picture slot. Other pictures decode serially (with
+the slice-level row threading of P / B slices and wavefront
+deblocking). The output is identical for every budget; `receive_frame`
+reports `NeedMore` while the next frame is still being reconstructed.
 
-On a 10 s 1080p30 x264 High-profile B-frame clip (this machine): one
-thread 3.8 s (was 7.4 s), 4 threads 1.1 s, 8 threads 0.77 s (≈ 390 fps).
+Samples are stored narrow (`u8` planes for 8-bit components, `u16`
+above), and non-MBAFF deblocking filters each macroblock edge
+line-parallel.
+
+10 s 1080p30 libx264 clips (`testsrc2`, preset medium), seconds, best
+of three on this machine (18 cores), before → after this round:
+
+| clip | 1 thread | 4 | 8 | 16 | peak RSS 1 / 16 threads |
+| ---- | -------- | - | - | -- | ----------------------- |
+| High, CABAC, B-frames | 3.87 → 2.62 | 1.09 → 0.65 | 0.71 → 0.41 | 0.73 → 0.27 | 530 → 59 / 768 → 566 MiB |
+| Constrained Baseline, CAVLC | 3.47 → 2.18 | 0.99 → 0.61 | 0.61 → 0.39 | 0.59 → 0.28 | 520 → 52 / 742 → 560 MiB |
+| High 10 | 4.45 → 3.46 | 1.25 → 0.89 | 0.83 → 0.54 | 0.82 → 0.34 | 555 → 92 / 696 → 703 MiB |
+
+Every output is byte-identical to `ffmpeg -f rawvideo` on these clips.
+
+Round 488 re-measured the High / CABAC / B-frames clip on the same
+machine under load from other builds (median of three; output
+byte-identical to the black-box decoder): 3.15 s (95 fps) at 1 thread,
+1.26 s (239 fps) at 2, 0.78 s (384 fps) at 4, 0.47 s (635 fps) at 8.
+The decoder was not changed this round.
+
+### Encoder speed
+
+`examples/encode_bench` pushes raw 4:2:0 frames through the registry
+encoder (`encode_bench clip.yuv 1920 1080 qp=26 cabac=true [out.h264]`).
+The encoder is single-threaded. Round 488 removed two kinds of waste
+from the motion search and the predictor builds, with byte-identical
+streams (MD5 of the output equal before / after on every row below):
+
+* every sub-pel SAD and every inter predictor used to widen the whole
+  reference plane to `i32` first — six 2-megapixel copies per
+  macroblock at 1080p, more in B pictures; they now read a window of
+  at most 26 x 26 samples fetched with the picture-edge clamp
+  (`encoder::refwin`), which the interpolators see exactly as they saw
+  the plane;
+* the integer full search sums absolute differences over fixed-size
+  `u8` rows (vectorised, no per-sample clamp inside the picture) and
+  stops a candidate at the first row that puts it above the best SAD
+  so far.
+
+1920x1080 `testsrc2`, 6 frames, QP 26, seconds (frames per second),
+same machine, before → after:
+
+| options | before | after |
+| ------- | ------ | ----- |
+| CAVLC (Baseline) | 57.5 (0.10) | 7.2 (0.83) |
+| `cabac=true` | 27.0 (0.22) | 2.2 (2.68) |
+| `cabac=true bframes=2` | 448.6 (0.013) | 6.4 (0.94) |
+
+What is left is the exhaustive ±16 integer search itself (two full
+searches per macroblock: 16x16 and four 8x8).
+
+MBAFF frames (interlaced 1080i broadcast) are not frame-threaded; their
+§8.7 deblocking runs by macroblock-pair row in a wavefront under the
+budget (a pair row starts a pair once the row above has filtered the
+pair to its upper right; 8 halo rows, since field-macroblock taps step
+two rows), and derives bS once per pair of 4x4 blocks instead of per
+sample line. 10 s 1080i25 libx264 clip (`testsrc2` re-interlaced
+top-field-first, High, CABAC, B-frames, preset medium), frames per
+second on this machine:
+
+| clip | 1 thread | 4 | 8 |
+| ---- | -------- | - | - |
+| 1080i MBAFF, before → after | 37 → 61 | 45 → 123 | 45 → 125 |
 
 ## Profiles + features in scope
 

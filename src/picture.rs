@@ -1,8 +1,8 @@
 //! Picture sample buffer for a decoded frame/field.
 //!
 //! Holds luma + chroma sample planes sized from the active SPS.
-//! Samples are stored as `i32` to accommodate bit_depth up to 14; the
-//! actual value range is `0..(1 << bit_depth)`.
+//! Samples are stored narrow ([`Samples`]: `u8` for an 8-bit component,
+//! `u16` for BitDepth 9..=14); the value range is `0..(1 << bit_depth)`.
 //!
 //! Spec references:
 //! * §6.2 — ChromaArrayType and sample-array layout.
@@ -12,6 +12,8 @@
 //!   (returns the nearest edge sample, per §8.4.2.2.1).
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
+
+pub use crate::sample_plane::Samples;
 
 /// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture:
 /// FLD (coded with `field_pic_flag` = 1), FRM (frame,
@@ -26,7 +28,7 @@ pub enum PicCodingStruct {
 
 /// A decoded picture sample buffer.
 ///
-/// `luma` is a row-major `i32` buffer of size
+/// `luma` is a row-major sample [`Samples`] of size
 /// `width_in_samples * height_in_samples`. Chroma planes `cb` / `cr`
 /// are sized from `chroma_array_type` (and are empty for monochrome).
 ///
@@ -40,9 +42,9 @@ pub struct Picture {
     pub chroma_array_type: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
-    pub luma: Vec<i32>,
-    pub cb: Vec<i32>,
-    pub cr: Vec<i32>,
+    pub luma: Samples,
+    pub cb: Samples,
+    pub cr: Samples,
     /// FFmpeg's `H264Picture.gray` (2da55bf): the samples are the gray
     /// fill of a frame_num gap frame made before anything recovered, or
     /// were predicted from such a frame. A reference list entry that is
@@ -154,9 +156,9 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            luma: vec![0; luma_len],
-            cb: vec![0; chroma_len],
-            cr: vec![0; chroma_len],
+            luma: Samples::zeroed(luma_len, bit_depth_luma),
+            cb: Samples::zeroed(chroma_len, bit_depth_chroma),
+            cr: Samples::zeroed(chroma_len, bit_depth_chroma),
             gray: false,
             pic_order_cnt: 0,
             frame_num: 0,
@@ -205,10 +207,10 @@ impl Picture {
             self.bit_depth_luma,
             self.bit_depth_chroma,
         );
-        let take_rows = |src: &[i32], width: usize, height: usize| -> Vec<i32> {
-            let mut v = Vec::with_capacity(width * height / 2);
+        let take_rows = |src: &Samples, width: usize, height: usize| -> Samples {
+            let mut v = src.empty_like();
             for row in (usize::from(bottom)..height).step_by(2) {
-                v.extend_from_slice(&src[row * width..(row + 1) * width]);
+                v.extend_from(src.slice(row * width..(row + 1) * width));
             }
             v
         };
@@ -279,12 +281,14 @@ impl Picture {
     /// a neighbour is available but the sample index goes off-picture.
     #[inline]
     pub fn luma_at(&self, x: i32, y: i32) -> i32 {
-        if self.width_in_samples == 0 || self.height_in_samples == 0 {
+        // A picture without samples (zero size, or a geometry-only
+        // shell) reads 0.
+        if self.luma.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, self.width_in_samples as i32 - 1, x) as usize;
         let yi = clip3_i32(0, self.height_in_samples as i32 - 1, y) as usize;
-        self.luma[yi * (self.width_in_samples as usize) + xi]
+        self.luma.get(yi * (self.width_in_samples as usize) + xi)
     }
 
     /// Clamped chroma Cb access (§6.2).
@@ -292,12 +296,12 @@ impl Picture {
     pub fn cb_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
-        if cw == 0 || ch == 0 {
+        if cw == 0 || ch == 0 || self.cb.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cb[yi * (cw as usize) + xi]
+        self.cb.get(yi * (cw as usize) + xi)
     }
 
     /// Clamped chroma Cr access.
@@ -305,12 +309,12 @@ impl Picture {
     pub fn cr_at(&self, x: i32, y: i32) -> i32 {
         let cw = self.chroma_width();
         let ch = self.chroma_height();
-        if cw == 0 || ch == 0 {
+        if cw == 0 || ch == 0 || self.cr.is_empty() {
             return 0;
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cr[yi * (cw as usize) + xi]
+        self.cr.get(yi * (cw as usize) + xi)
     }
 
     /// Write a luma sample. Out-of-bounds writes are silently ignored
@@ -327,7 +331,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (self.width_in_samples as usize) + (xi as usize);
-        self.luma[idx] = v;
+        self.luma.set(idx, v);
     }
 
     /// Write a Cb sample.
@@ -344,7 +348,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cb[idx] = v;
+        self.cb.set(idx, v);
     }
 
     /// Write a Cr sample.
@@ -361,7 +365,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cr[idx] = v;
+        self.cr.set(idx, v);
     }
 
     /// Fetch the colocated L0 MV + refIdx for the 4x4 block at
@@ -405,6 +409,60 @@ impl Picture {
             .copied()
             .unwrap_or(false);
         Some((mv, ref_idx, is_intra))
+    }
+}
+
+/// §8.4.1.2 — the per-macroblock motion of a decoded picture that a
+/// later B slice's direct prediction reads when the picture is its
+/// co-located picture: the [`Picture`] fields of the same names.
+#[derive(Debug, Clone, Default)]
+pub struct MotionGrids {
+    pub mb_width_in_picture: u32,
+    pub mv_l0_grid: Vec<(i16, i16)>,
+    pub mv_l1_grid: Vec<(i16, i16)>,
+    pub ref_idx_l0_grid: Vec<i8>,
+    pub ref_idx_l1_grid: Vec<i8>,
+    pub is_intra_grid: Vec<bool>,
+    pub mb_field_flags: Vec<bool>,
+}
+
+impl MotionGrids {
+    /// Snapshot the motion a picture's macroblock grid holds.
+    pub fn from_grid(grid: &crate::mb_grid::MbGrid) -> Self {
+        let nmb = grid.info.len();
+        let mut m = MotionGrids {
+            mb_width_in_picture: grid.width_in_mbs,
+            mv_l0_grid: Vec::with_capacity(nmb * 16),
+            mv_l1_grid: Vec::with_capacity(nmb * 16),
+            ref_idx_l0_grid: Vec::with_capacity(nmb * 4),
+            ref_idx_l1_grid: Vec::with_capacity(nmb * 4),
+            is_intra_grid: Vec::with_capacity(nmb),
+            mb_field_flags: Vec::with_capacity(nmb),
+        };
+        for info in &grid.info {
+            m.mv_l0_grid.extend_from_slice(&info.mv_l0);
+            m.mv_l1_grid.extend_from_slice(&info.mv_l1);
+            m.ref_idx_l0_grid.extend_from_slice(&info.ref_idx_l0);
+            m.ref_idx_l1_grid.extend_from_slice(&info.ref_idx_l1);
+            m.is_intra_grid.push(info.is_intra);
+            // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB,
+            // for AFRM pictures serving as colPic.
+            m.mb_field_flags.push(info.mb_field_decoding_flag);
+        }
+        m
+    }
+}
+
+impl Picture {
+    /// Install a motion snapshot (see [`MotionGrids`]).
+    pub fn set_motion(&mut self, m: &MotionGrids) {
+        self.mb_width_in_picture = m.mb_width_in_picture;
+        self.mv_l0_grid.clone_from(&m.mv_l0_grid);
+        self.mv_l1_grid.clone_from(&m.mv_l1_grid);
+        self.ref_idx_l0_grid.clone_from(&m.ref_idx_l0_grid);
+        self.ref_idx_l1_grid.clone_from(&m.ref_idx_l1_grid);
+        self.is_intra_grid.clone_from(&m.is_intra_grid);
+        self.mb_field_flags.clone_from(&m.mb_field_flags);
     }
 }
 
@@ -525,6 +583,6 @@ mod tests {
         // Should not panic.
         p.set_luma(100, 100, 42);
         p.set_luma(-1, -1, 42);
-        assert_eq!(p.luma, vec![0; 16]);
+        assert_eq!(p.luma.to_i32_vec(), vec![0; 16]);
     }
 }

@@ -9,6 +9,234 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Frame cropping in the encoder (§7.4.2.1.1): picture sizes that are
+  not a whole number of macroblocks are coded on a padded grid (last
+  column / row repeated; for field and MBAFF coding the last row of
+  each field parity, on a grid of whole macroblock pairs) and the SPS
+  carries `frame_cropping_flag = 1` with `frame_crop_right_offset` /
+  `frame_crop_bottom_offset` in `CropUnitX` / `CropUnitY` units for the
+  chroma format and `frame_mbs_only_flag`. The registry encoder,
+  `EncoderSession`, `encoder::deep::DeepSession` and the PAFF / MBAFF
+  drivers take any size on the crop-unit grid (4:2:0: even width and
+  height; 4:2:2: even width; 4:4:4: any; height a multiple of 4 for
+  interlaced 4:2:0); the stateless `Encoder` gains
+  `EncoderConfig::crop_right` / `crop_bottom`. Sizes off the grid are
+  refused with a clean error. Reconstructions returned by the
+  high-bit-depth and interlaced drivers are cropped to the picture
+  size. Verified per size x layout x entropy coder against our decoder
+  and a black-box decoder (`integration_frame_cropping`).
+
+- 4:0:0 (monochrome) encoding of grey input through the registry
+  encoder: `Gray8` / `Gray10Le` / `Gray12Le` are coded with
+  `chroma_format_idc = 0` (luma only) under the §A.2 minimum
+  High-family profile (High 100 / High 10 110 / High 4:4:4 Predictive
+  244 for 12 bit and lossless) and the output layout is the grey format.
+  `Gray8` keeps the IDR / P / B session with CAVLC or CABAC and rate
+  control (`SessionConfig::monochrome` / `with_monochrome`; per-picture
+  QP without the MB-row modulation); the high-bit-depth encoder
+  (`DeepConfig::chroma_format_idc = 0`) codes luma-only Intra_16x16 /
+  Intra_4x4 / P_Skip / P_L0_16x16 with the 4x4 or 8x8 transform, CAVLC
+  and CABAC, lossy and lossless, at 8..=14 bit. Intra pictures come out
+  smaller than the former 4:2:0-with-constant-chroma carriage (160x128,
+  QP 26: −1.3 % CAVLC). Every stream is checked against our decoder and
+  a black-box decoder (`integration_gray_400`).
+
+- Intra_8x8 above 8 bit: the high-bit-depth encoder (`encoder::deep`,
+  registry option `intra_8x8`, default on, with `transform_8x8=true`)
+  codes Intra_8x8 macroblocks at 8..=14 bit and 4:0:0 / 4:2:0 / 4:2:2 —
+  §8.3.2 prediction from the filtered reference samples, §8.3.2.1
+  predicted-mode coding, the 8x8 residual at QP′ or the §8.5.15 DPCM
+  under transform bypass, CAVLC and CABAC — competing per macroblock
+  with Intra_16x16 and Intra_4x4 (`DeepSession::with_intra_8x8`,
+  `i8x8_mbs`).
+- Intra_4x4 and Intra_8x8 inside P pictures on the same path
+  (ChromaArrayType 0 / 1 / 2): the cheapest of the three intra
+  predictions is the alternative to the inter macroblock.
+
+### Performance
+
+- Encoder motion search and inter predictor builds (8-bit paths),
+  streams byte-identical: sub-pel SADs and predictors read a small
+  reference window (`encoder::refwin`, at most 26 x 26 samples fetched
+  with the picture-edge clamp) instead of widening the whole reference
+  plane to `i32` per block, and the integer full search sums fixed-size
+  `u8` rows with early termination against the best SAD. 1920x1080,
+  6 frames, QP 26: CAVLC 57.5 → 7.2 s, CABAC 27.0 → 2.2 s, CABAC with
+  two B pictures 448.6 → 6.4 s. `examples/encode_bench` times the
+  registry encoder on raw 4:2:0 input.
+
+### Changed
+
+- Registry encoder: grey input no longer produces a 4:2:0 stream with
+  constant chroma planes (`Yuv420P*` out) but a 4:0:0 stream (`Gray*`
+  out, High-family profile). `profile=baseline` / `main` keep the
+  earlier 4:2:0 carriage for `Gray8`.
+
+### Fixed
+
+- 8x8 transform quality (every encoder path with `transform_8x8`): the
+  forward 8x8 quantiser used one multiplier per normAdjust8x8 entry and
+  left out the basis-row norms of the position class, so coefficients
+  on rows / columns 2 and 6 were coded at 39 %..71 % of their value and
+  those on odd rows / columns at up to 127 % — valid streams, but 8x8
+  blocks with texture reconstructed several dB below what their QP
+  buys. The multiplier now carries the class norm (`64 / (p_i · p_j)`);
+  a per-basis-function round-trip test pins it.
+- CABAC P pictures at 4:4:4 with `transform_8x8`: when the 8x8 luma
+  trial won with an all-zero residual and a chroma plane then raised
+  the shared `coded_block_pattern` bit, the stream carried the 4x4 luma
+  levels while the encoder's reconstruction used the zero 8x8 residual
+  (encoder / decoder drift on that macroblock). The transform-size flag
+  is now settled after the chroma planes are coded.
+- Lints of the 1.100 toolchain (`needless_range_loop` on loops whose
+  variable is also used elsewhere, a duplicated `allow`).
+
+## [0.1.12](https://github.com/OxideAV/oxideav-h264/compare/v0.1.11...v0.1.12) - 2026-11-07
+
+### Other
+
+- MBAFF deblocking: bS per 4x4 block pair, pair-row wavefront under a thread budget (#11, #19)
+- random access at recovery points and lost-reference concealment ([#11](https://github.com/OxideAV/oxideav-h264/pull/11))
+- API hygiene: #[non_exhaustive] growable types, #[doc(hidden)] internals
+
+### Added
+
+- `with_*` setters for every field of `encoder::EncoderConfig` (start
+  from `EncoderConfig::new(width, height)`) and `sei::SeiContext` (start
+  from `Default`); `encoder::deep::DeepConfig::new(width, height,
+  bit_depth_luma, bit_depth_chroma, chroma_format_idc, qp)` plus `with_*`;
+  all-field `new(..)` constructors for `encoder::EncodedIdr`,
+  `EncodedP`, `EncodedB`, `deep::DeepEncoded`, `rate_control::FramePlan`,
+  `rate_control::CommitOutcome` and `session::SessionFrame`.
+
+### Fixed
+
+- Random access (#11): decoding that starts at a non-IDR picture — a
+  broadcast stream joined mid-way, which carries no IDR at all — now
+  follows D.2.8. Entry is at an intra-coded picture or at an access unit
+  carrying a recovery point SEI message (intra-refresh P pictures
+  included); references to pictures that precede the entry point are
+  inferred as all-intra mid-grey pictures (NOTE 3) instead of failing
+  the slice, and pictures preceding the recovery point in output order
+  (open-GOP leading B pictures, the refresh period of
+  `recovery_frame_cnt`) are decoded but not output. Previously one
+  leading reference B picture failed, its frame_num was never recorded
+  and every later picture was rejected: a 1920x1080 MBAFF open-GOP
+  stream cut at a non-IDR I picture output 1 of 51 frames; it now
+  decodes byte-identical to a black-box reference decoder at 1 and 8
+  threads.
+- Lost reference pictures (#11): a frame_num jump the SPS does not allow
+  is inferred as an unintentional loss (§8.2.5.2 NOTE 2) — the gap
+  process runs with concealment references (a copy of the last
+  reference frame, else mid-grey) and decoding resynchronises at the
+  next recovery point, instead of rejecting every picture until the
+  next IDR.
+
+### Performance
+
+- MBAFF deblocking (#11, #19): bS is derived once per pair of 4x4
+  luma blocks along an edge (and remembered across the chroma lines and
+  planes that map onto them) instead of once per sample line, and under
+  a thread budget the MBAFF walker runs by macroblock-pair row in a
+  wavefront (8 halo rows over each 32-row pair row; a row filters pair
+  x once the row above has filtered pair x + 1), output identical to
+  the serial walk. 10 s 1080i25 High CABAC libx264 clip: 37 → 61 fps
+  single-threaded, 45 → 125 fps at 8 threads; byte-identical to a
+  black-box reference decoder at every budget (also 4:2:2 10-bit,
+  bottom-field-first CAVLC and multi-slice MBAFF streams).
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the enums `sei::SeiError`,
+  `sei::SeiPayload`, `encoder::ScalingMatrixMode`,
+  `encoder::ScalingListsSpec`, `deep::DeepPictureKind`,
+  `rate_control::RateControlMode`, `rate_control::RcFrameKind`,
+  `session::SessionRateControl`, `session::SessionFrameKind`, and on the
+  records `EncoderConfig`, `DeepConfig`, `SeiContext`,
+  `rate_control::RateControlConfig`, `session::SessionConfig` plus the
+  output records listed under Added. Tests and fuzz targets build them
+  through the constructors.
+- The stand-alone encoder drivers that only the test suite reaches —
+  `encoder::{field, mbaff, mbaff_cabac, multiref, scp, slices, sp}` — are
+  now `#[doc(hidden)]`. SEI payload syntax records, the `YuvFrame`
+  plane buffer and the borrowed `EncodedFrameRef` view stay exhaustive.
+
+## [0.1.11](https://github.com/OxideAV/oxideav-h264/compare/v0.1.10...v0.1.11) - 2026-11-06
+
+### Other
+
+- :StreamParams: in-band event at every output-shape change; encoder re-configures on it
+- inter residual: add the luma residual in place in the prediction buffer
+- frame-threading layout and 1080p decode timings (1 / 4 / 8 / 16 threads)
+- decode speed: motion compensation straight into the prediction for copy partitions
+- frame threading: free a picture slot when any picture finishes, decoder thread helps with parses only
+- decode speed: inline partition lists, per-partition reference keys, identity-weight shortcut
+- decode speed: both chroma planes per deblock pass, smaller parsed macroblocks
+- decode speed: CABAC lookahead window, typed MC gather, vectorisable clipping
+- frame threading: macroblock checks with the slice parse, motion derivation in the picture job
+- decode speed: narrow sample planes (u8 / u16) and line-parallel frame deblocking
+- reset keeps the avcC parameter sets in force
+- :output_params + output_params_generation from the SPS / avcC
+
+### Performance
+
+- Decoded pictures store samples narrow: `u8` planes for 8-bit
+  components, `u16` for BitDepth 9..=14 (`sample_plane::Samples`),
+  instead of `i32` — a quarter / half of the memory traffic of every
+  reference fetch, band publish and output copy; an 8-bit plane is
+  handed to the output frame as-is. Arithmetic stays in `i32` on the
+  per-block working buffers.
+- §8.7 deblocking of non-MBAFF pictures filters each macroblock edge
+  line-parallel (all 16 / 8 lines at once, branch-free, vectorised)
+  with α / β / tC0 derived once per edge, and derives bS with
+  whole-edge shortcuts for intra sides, a raster non-zero mask and one
+  motion comparison per edge between uniformly moving macroblocks.
+  Single-threaded 1080p High-profile decode: 17.0 → 14.1 G cycles.
+- Frame threading takes the per-macroblock work off the decoder
+  thread: a slice's decoding-order checks (partition structure, intra
+  prediction-mode availability, every reference index a macroblock
+  uses — spatial-direct ones from the neighbours' indices) run with its
+  slice-data parse on the pool, the decoder thread only checks the
+  used reference indices against the lists; the §8.4.1 motion
+  derivation of P and spatial-direct B slices runs at the start of the
+  picture's pool job, which publishes the motion for the B pictures
+  that take it as co-located picture (temporal-direct B slices still
+  derive theirs on the decoder thread, from that published motion).
+  While it waits for a picture slot — any in-flight picture finishing
+  frees one; the budget plus two pictures are in flight — the decoder
+  thread runs queued slice-data parses (never a picture job, which
+  would hold back the next pictures).
+- The CABAC engine keeps `codIOffset` with up to 40 bits of lookahead
+  (`value = codIOffset · 2^pending + next bits`), so RenormD and bypass
+  bins only move a bit count instead of reading bit by bit; a read past
+  the end of the slice data still fails at the same bin.
+- Motion-compensation windows are gathered from 8-bit / 16-bit planes
+  with fixed-length widening row copies; sample clipping uses min / max
+  so the combine / residual loops vectorise; scaling lists are derived
+  only for blocks that carry coefficients; the slice-data parser
+  reserves room for the picture's macroblocks up front.
+- Chroma deblocking of a non-MBAFF macroblock filters Cb and Cr in one
+  pass over the shared bS (8 lanes for a 4:2:0 edge); the parsed
+  `Macroblock` boxes its rarely present parts (`sub_mb_pred`,
+  `pcm_samples`, the 4:4:4 Cb / Cr DC blocks) and keeps the
+  per-partition `ref_idx` / `mvd` lists inline (`PartList`, at most
+  four entries), 872 → 440 bytes with no heap allocation for them; the
+  CABAC bin trace is out of line.
+- Motion: the reference-identity key of a partition is derived once per
+  partition, spatial direct derives its median prediction once per
+  macroblock (§8.4.1.2.2 NOTE 3). Weighted prediction with identity
+  weights (w = 2^logWD, o = 0) combines as the plain copy / average it
+  equals, and 8-bit planes skip the separate Clip1 pass (their store
+  saturates).
+- A single-list partition whose combine is a plain copy (default
+  prediction, or explicit identity weights) is motion-compensated
+  straight into the macroblock's prediction, luma and both chroma
+  planes; frame-threaded inter macroblocks are reconstructed straight
+  into the picture (no one-macroblock scratch copy); the inter luma
+  residual is added in place in the prediction buffer.
+
+### Added
+
 - `Decoder::output_params` / `output_params_generation` (oxideav-core
   0.1.42), with `output_pixel_format` forwarded to it: the cropped
   width / height, pixel format (including separate-colour-plane 4:4:4
@@ -19,10 +247,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth and the worker budget do not move the switch point). Verified
   against ffprobe on black-box libx264 fixtures
   (`tests/fixtures/output_params/`, `gen.sh`).
+- The in-band `Frame::StreamParams` event (oxideav-core 0.1.43):
+  `receive_frame` returns one event carrying the new `output_params()`
+  answer immediately before the first frame of a new shape — a new
+  active SPS changing the size, cropping, chroma format, bit depth, VUI
+  frame rate or colour signal, or a lone field emitted at half height —
+  exactly where the generation moves, never for the first shape. The
+  old-shape pictures still in the §C.4 reorder queue come out first, at
+  every worker budget; the same holds after `reset()` and while
+  draining after `flush()`; `receive_arena_frame` skips the event.
+  Gated on black-box libx264 splices with B-frames (64x48 → 80x46 →
+  10-bit → 4:2:2 → 64x48, and a constant-shape splice;
+  `tests/fixtures/output_params/gen_events.sh`) at 1 / 4 / 8 workers,
+  every picture bit-identical to its own segment decoded alone.
+- The registry encoder re-configures on `Frame::StreamParams` (Annex B
+  output): the old configuration's B-frame tail is drained, the next
+  frame opens a new coded video sequence (IDR with the new SPS / PPS in
+  band, §7.4.1.2.1, `idr_pic_id` continuing the old sequence's,
+  §7.4.3), `pts` / `dts` keep counting and `output_params()` describes
+  the new output; the coding path follows the new layout (8-bit 4:2:0
+  session ↔ High-family). An event that changes nothing is a no-op;
+  `format=avcc` (parameter sets fixed in the extradata record) and
+  shapes no coding path takes return `Error::Unsupported`, leaving the
+  encoder as it was.
 - Reconciled with PearTube's recovered/open-GOP output gate, PAFF pairing,
   cropped emitted dimensions and full-range `YuvJ*` labels. Shape metadata
   follows only pictures that pass recovery; parsing a newer SPS cannot
   relabel pictures still waiting in output order.
+
+### Changed
+
+- `Frame::StreamParams` reaches the encoder as a re-configuration
+  request instead of the `Error::InvalidData` every non-video frame got
+  before.
 
 ### Fixed
 

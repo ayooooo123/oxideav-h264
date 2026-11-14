@@ -2749,7 +2749,7 @@ mod tests {
 
     #[test]
     fn zero_8x8_block_short_cut_matches_the_full_butterfly() {
-        assert_eq!(inverse_core_8x8(&[0; 64]), [0; 64]);
+        assert_eq!(inverse_core_8x8(&[0; 64], 0xFF), [0; 64]);
         let flat = default_scaling_list_8x8_flat();
         for qp in [0, 26, 51] {
             let r = inverse_transform_8x8(&[0; 64], qp, &flat, 8).unwrap();

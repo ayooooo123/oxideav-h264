@@ -72,16 +72,11 @@ use crate::bitstream::{BitError, BitReader};
 /// decoding is on the hot path (millions of calls per frame), and a
 /// `getenv()` syscall per bin is the difference between sub-realtime
 /// and sub-second-per-frame decoding on a 720p clip.
-#[inline(always)]
+#[inline]
 fn bin_trace_enabled() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::LazyLock;
-        static CACHED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some());
-        return *CACHED;
-    }
-    #[cfg(not(debug_assertions))]
-    false
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -276,27 +271,46 @@ pub fn validate_init_idc(init_idc: Option<u32>) -> CabacResult<Option<u32>> {
 
 /// CABAC arithmetic decoder engine state per §9.3.1.2 / §9.3.3.2.
 ///
-/// `cod_i_range` and `cod_i_offset` are held as `u32` but never exceed
-/// the 10-bit register precision required by the spec (§9.3.1.2 NOTE —
-/// 9 bits suffice for DecodeDecision/DecodeTerminate, 10 bits for
-/// DecodeBypass because of the doubling step).
+/// `codIRange` is held as is. `codIOffset` is held together with the
+/// next `pending` bits of the bitstream, already read: `value =
+/// codIOffset · 2^pending + (those bits)`. Since the bits are below
+/// `2^pending`, `codIOffset >= codIRange` exactly when `value >=
+/// codIRange · 2^pending`, and subtracting `codIRange · 2^pending` from
+/// `value` is subtracting `codIRange` from `codIOffset`. The doubling of
+/// RenormD (`codIOffset = codIOffset · 2 + read_bits(1)`, Figure 9-4)
+/// and of DecodeBypass (Figure 9-5) then leaves `value` unchanged and
+/// moves one bit from the lookahead into `codIOffset` — `pending`
+/// decreases. Bits are read into the lookahead 32 at a time.
+///
+/// Past the end of the data the lookahead is padded with zero bits
+/// (`padding` of them, the lowest of `value`); taking a padding bit
+/// into `codIOffset` is a read past the end, reported as the
+/// [`BitError::Eof`] a bit-by-bit read gives at the same bin.
 pub struct CabacDecoder<'a> {
     /// §9.3.1.2 — `codIRange`, initialised to 510.
     cod_i_range: u32,
-    /// §9.3.1.2 — `codIOffset`, initialised from `read_bits(9)`.
-    cod_i_offset: u32,
+    /// `codIOffset · 2^pending` plus the lookahead bits.
+    value: u64,
+    /// Lookahead bits in `value` (padding included).
+    pending: u32,
+    /// Zero bits appended past the end of the data.
+    padding: u32,
     reader: BitReader<'a>,
     /// Running count of bins decoded (decision + bypass + terminate).
     /// Used only for debug instrumentation, never affects decoding.
     bin_count: u64,
 }
 
+/// Lookahead bits each engine operation may take into `codIOffset`
+/// (RenormD after a decision needs at most 6: codIRangeLPS ≥ 6).
+const MIN_LOOKAHEAD: u32 = 8;
+
 impl<'a> core::fmt::Debug for CabacDecoder<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CabacDecoder")
             .field("cod_i_range", &self.cod_i_range)
-            .field("cod_i_offset", &self.cod_i_offset)
-            .field("reader_position", &self.reader.position())
+            .field("cod_i_offset", &self.offset())
+            .field("reader_position", &self.position())
             .finish()
     }
 }
@@ -311,12 +325,57 @@ impl<'a> CabacDecoder<'a> {
     /// accept any 9-bit value here and let higher layers validate.
     pub fn new(mut reader: BitReader<'a>) -> CabacResult<Self> {
         let cod_i_offset = reader.u(9)?;
-        Ok(Self {
+        let mut dec = Self {
             cod_i_range: 510,
-            cod_i_offset,
+            value: cod_i_offset as u64,
+            pending: 0,
+            padding: 0,
             reader,
             bin_count: 0,
-        })
+        };
+        dec.refill();
+        Ok(dec)
+    }
+
+    /// Top the lookahead up (to at least [`MIN_LOOKAHEAD`] bits,
+    /// zero-padded past the end of the data).
+    #[inline(never)]
+    fn refill(&mut self) {
+        let k = self.reader.bits_remaining().min(32) as u32;
+        if k > 0 {
+            let bits = self.reader.u(k).unwrap_or(0);
+            self.value = (self.value << k) | bits as u64;
+            self.pending += k;
+        }
+        if self.pending < MIN_LOOKAHEAD {
+            let p = MIN_LOOKAHEAD - self.pending;
+            self.value <<= p;
+            self.pending += p;
+            self.padding += p;
+        }
+    }
+
+    /// Take `n` lookahead bits into `codIOffset` (the reads of RenormD /
+    /// DecodeBypass).
+    #[inline(always)]
+    fn take_bits(&mut self, n: u32) -> CabacResult<()> {
+        if n + self.padding > self.pending {
+            return Err(CabacError::Bitstream(BitError::Eof));
+        }
+        self.pending -= n;
+        Ok(())
+    }
+
+    /// `codIRange · 2^pending`, the range in `value`'s scale.
+    #[inline(always)]
+    fn scaled_range(&self) -> u64 {
+        (self.cod_i_range as u64) << self.pending
+    }
+
+    /// §9.3.1.2 `codIOffset`.
+    #[inline]
+    fn offset(&self) -> u32 {
+        (self.value >> self.pending) as u32
     }
 
     /// Total number of bins decoded so far (decision + bypass + terminate).
@@ -325,10 +384,13 @@ impl<'a> CabacDecoder<'a> {
         self.bin_count
     }
 
-    /// Cursor into the underlying reader — exposed for slice-layer code
-    /// that needs to know the post-CABAC position (e.g. for debug).
+    /// Cursor just past the last bit the engine consumed (read into
+    /// `codIOffset`) — where a §7.3.5 I_PCM payload starts.
     pub fn position(&self) -> (usize, u8) {
-        self.reader.position()
+        let (byte, bit) = self.reader.position();
+        let read = byte * 8 + bit as usize;
+        let consumed = read - (self.pending - self.padding) as usize;
+        (consumed / 8, (consumed % 8) as u8)
     }
 
     /// Current `codIRange` — exposed for tests.
@@ -340,7 +402,15 @@ impl<'a> CabacDecoder<'a> {
     /// Current `codIOffset` — exposed for tests.
     #[cfg(test)]
     fn cod_i_offset(&self) -> u32 {
-        self.cod_i_offset
+        self.offset()
+    }
+
+    /// Set `codIRange` / `codIOffset` — tests only.
+    #[cfg(test)]
+    fn set_state(&mut self, range: u32, offset: u32) {
+        self.cod_i_range = range;
+        let low = self.value & ((1u64 << self.pending) - 1);
+        self.value = ((offset as u64) << self.pending) | low;
     }
 
     /// Current `codIRange` — exposed for debug-only external callers
@@ -351,7 +421,7 @@ impl<'a> CabacDecoder<'a> {
 
     /// Current `codIOffset` — exposed for debug-only external callers.
     pub fn debug_offset(&self) -> u32 {
-        self.cod_i_offset
+        self.offset()
     }
 
     /// §9.3.3.2.1 — DecodeDecision. Returns the decoded bin (0 or 1)
@@ -365,82 +435,170 @@ impl<'a> CabacDecoder<'a> {
     ///       binVal      = 1 - valMPS
     ///       codIOffset -= codIRange
     ///       codIRange   = codIRangeLPS
-    ///       if pStateIdx == 0: valMPS = 1 - valMPS                   (9-27)
+    ///       if pStateIdx == 0: valMPS = 1 - valMPS
     ///       pStateIdx   = transIdxLPS[pStateIdx]
     ///   else:
     ///       binVal      = valMPS
     ///       pStateIdx   = transIdxMPS[pStateIdx]
     ///   RenormD()
-    #[inline(always)]
+    #[inline]
     pub fn decode_decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
-        let state = (ctx.state_idx as usize) & 63;
+        if self.pending < MIN_LOOKAHEAD {
+            self.refill();
+        }
+        let trace = bin_trace_enabled();
+        let pre = if trace {
+            (ctx.state_idx, ctx.val_mps, self.cod_i_range, self.offset())
+        } else {
+            (0, 0, 0, 0)
+        };
+
+        // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-        let cod_i_range_lps = RANGE_TAB_LPS[state][q_idx] as u32;
+        let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
         self.cod_i_range -= cod_i_range_lps;
 
+        let scaled = self.scaled_range();
         let bin_val: u8;
-        if self.cod_i_offset < self.cod_i_range {
-            bin_val = ctx.val_mps;
-            ctx.state_idx = TRANS_IDX_MPS[state];
-        } else {
+        if self.value >= scaled {
+            // LPS path.
             bin_val = 1 - ctx.val_mps;
-            self.cod_i_offset -= self.cod_i_range;
+            self.value -= scaled;
             self.cod_i_range = cod_i_range_lps;
-            if state == 0 {
-                ctx.val_mps = bin_val;
+            // §9.3.3.2.1.1 equation (9-27).
+            if ctx.state_idx == 0 {
+                ctx.val_mps = 1 - ctx.val_mps;
             }
-            ctx.state_idx = TRANS_IDX_LPS[state];
+            ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
+        } else {
+            // MPS path.
+            bin_val = ctx.val_mps;
+            ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
         }
 
-        if self.cod_i_range < 256 {
-            self.renorm_d()?;
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.bin_count = self.bin_count.wrapping_add(1);
+        self.renorm_d()?;
+        self.bin_count = self.bin_count.wrapping_add(1);
+        if trace {
+            self.trace_decision(pre, bin_val, ctx);
         }
         Ok(bin_val)
     }
 
-    #[inline(always)]
+    /// `OXIDEAV_H264_BIN_TRACE` line of a decision bin.
+    #[cold]
+    #[inline(never)]
+    fn trace_decision(&self, pre: (u8, u8, u32, u32), bin_val: u8, ctx: &CtxState) {
+        eprintln!(
+            "[BIN {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_offset={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_offset={:>4}",
+            self.bin_count,
+            pre.0,
+            pre.1,
+            pre.2,
+            pre.3,
+            bin_val,
+            ctx.state_idx,
+            ctx.val_mps,
+            self.cod_i_range,
+            self.offset(),
+        );
+    }
+
+    /// §9.3.3.2.3 — DecodeBypass. Reads one bypass bin (no context,
+    /// no state update, no renorm of the state machine).
+    ///
+    /// Algorithm (Figure 9-5):
+    ///   codIOffset = (codIOffset << 1) | read_bits(1)
+    ///   if codIOffset >= codIRange:
+    ///       binVal     = 1
+    ///       codIOffset -= codIRange
+    ///   else:
+    ///       binVal = 0
+    #[inline]
     pub fn decode_bypass(&mut self) -> CabacResult<u8> {
-        self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.short(1)?;
-        let bin = if self.cod_i_offset >= self.cod_i_range {
-            self.cod_i_offset -= self.cod_i_range;
+        if self.pending < MIN_LOOKAHEAD {
+            self.refill();
+        }
+        let pre = (self.cod_i_range, self.offset());
+        self.take_bits(1)?;
+        let scaled = self.scaled_range();
+        let bin = if self.value >= scaled {
+            self.value -= scaled;
             1
         } else {
             0
         };
-        #[cfg(debug_assertions)]
-        {
-            self.bin_count = self.bin_count.wrapping_add(1);
+        self.bin_count = self.bin_count.wrapping_add(1);
+        if bin_trace_enabled() {
+            eprintln!(
+                "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+                self.bin_count,
+                pre.0,
+                pre.1,
+                bin,
+                self.cod_i_range,
+                self.offset(),
+            );
         }
         Ok(bin)
     }
 
-    #[inline(always)]
+    /// §9.3.3.2.4 — DecodeTerminate. Special path for `end_of_slice_flag`
+    /// and the I_PCM terminator bin (ctxIdx = 276).
+    ///
+    /// Algorithm (Figure 9-6):
+    ///   codIRange -= 2
+    ///   if codIOffset >= codIRange:
+    ///       binVal = 1  (decoding terminated, no renorm)
+    ///   else:
+    ///       binVal = 0
+    ///       RenormD()
     pub fn decode_terminate(&mut self) -> CabacResult<u8> {
+        if self.pending < MIN_LOOKAHEAD {
+            self.refill();
+        }
+        let pre = (self.cod_i_range, self.offset());
         self.cod_i_range -= 2;
-        let bin = if self.cod_i_offset >= self.cod_i_range {
+        let bin = if self.value >= self.scaled_range() {
+            // Terminated. Per spec: "no renormalization is carried out, and
+            // CABAC decoding is terminated". The last inserted bit is the
+            // rbsp_stop_one_bit when decoding end_of_slice_flag.
             1
         } else {
-            if self.cod_i_range < 256 {
-                self.renorm_d()?;
-            }
+            self.renorm_d()?;
             0
         };
-        #[cfg(debug_assertions)]
-        {
-            self.bin_count = self.bin_count.wrapping_add(1);
+        self.bin_count = self.bin_count.wrapping_add(1);
+        if bin_trace_enabled() {
+            eprintln!(
+                "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
+                self.bin_count,
+                pre.0,
+                pre.1,
+                bin,
+                self.cod_i_range,
+                self.offset(),
+            );
         }
         Ok(bin)
     }
 
+    /// §9.3.3.2.2 — RenormD. Called after DecodeDecision whenever
+    /// `codIRange < 256`, and from DecodeTerminate on the "not yet"
+    /// branch.
+    ///
+    /// Algorithm (Figure 9-4):
+    ///   while codIRange < 256:
+    ///       codIRange  <<= 1
+    ///       codIOffset  = (codIOffset << 1) | read_bits(1)
     #[inline(always)]
     fn renorm_d(&mut self) -> CabacResult<()> {
-        let shift = self.cod_i_range.leading_zeros() - 23;
-        self.cod_i_range <<= shift;
-        self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.short(shift)?;
+        // All doublings at once: `codIRange` (≥ 2 here) needs `shift`
+        // of them to reach 256, each taking one lookahead bit.
+        if self.cod_i_range < 256 {
+            let shift = self.cod_i_range.leading_zeros() - 23;
+            self.cod_i_range <<= shift;
+            self.take_bits(shift)?;
+        }
         Ok(())
     }
 }
@@ -647,8 +805,7 @@ mod tests {
         // Engine init consumes 9 zero bits, RenormD reads 1 more zero.
         let data = [0x00, 0x00];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
-        dec.cod_i_range = 270;
-        dec.cod_i_offset = 0;
+        dec.set_state(270, 0);
         let mut ctx = CtxState {
             state_idx: 1,
             val_mps: 0,

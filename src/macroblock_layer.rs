@@ -662,6 +662,77 @@ pub struct PcmSamples {
     pub chroma_cr: Vec<u32>,
 }
 
+/// The per-partition syntax elements of one `mb_pred()` /
+/// `sub_mb_pred()` list (§7.3.5.1 / §7.3.5.2: at most four — NumMbPart
+/// or NumSubMbPart), held inline rather than on the heap. Reads as a
+/// slice of the elements pushed.
+#[derive(Clone, Copy)]
+pub struct PartList<T: Copy + Default> {
+    items: [T; 4],
+    len: u8,
+}
+
+impl<T: Copy + Default> PartList<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `v` (a fifth element is dropped: no syntax structure has
+    /// more than four partitions).
+    pub fn push(&mut self, v: T) {
+        if (self.len as usize) < self.items.len() {
+            self.items[self.len as usize] = v;
+            self.len += 1;
+        }
+    }
+}
+
+impl<T: Copy + Default> Default for PartList<T> {
+    fn default() -> Self {
+        Self {
+            items: [T::default(); 4],
+            len: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default> std::ops::Deref for PartList<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len as usize]
+    }
+}
+
+impl<T: Copy + Default> std::ops::DerefMut for PartList<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.items[..self.len as usize]
+    }
+}
+
+impl<T: Copy + Default + PartialEq> PartialEq for PartList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Copy + Default + Eq> Eq for PartList<T> {}
+
+impl<T: Copy + Default + std::fmt::Debug> std::fmt::Debug for PartList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Copy + Default> From<Vec<T>> for PartList<T> {
+    fn from(v: Vec<T>) -> Self {
+        let mut l = Self::default();
+        for x in v {
+            l.push(x);
+        }
+        l
+    }
+}
+
 /// §7.3.5.1 / §7.4.5.1 — `mb_pred()` for non-sub_mb path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MbPred {
@@ -676,11 +747,11 @@ pub struct MbPred {
     pub intra_chroma_pred_mode: u8,
     /// For inter prediction: ref_idx_l0 / ref_idx_l1 for each of the
     /// `NumMbPart` partitions.
-    pub ref_idx_l0: Vec<u32>,
-    pub ref_idx_l1: Vec<u32>,
+    pub ref_idx_l0: PartList<u32>,
+    pub ref_idx_l1: PartList<u32>,
     /// MVD[mb_part][component] per partition (list 0 / list 1).
-    pub mvd_l0: Vec<[i32; 2]>,
-    pub mvd_l1: Vec<[i32; 2]>,
+    pub mvd_l0: PartList<[i32; 2]>,
+    pub mvd_l1: PartList<[i32; 2]>,
 }
 
 /// §7.3.5.2 / §7.4.5.2 — `sub_mb_pred()` payload.
@@ -692,8 +763,8 @@ pub struct SubMbPred {
     /// `mvd_lX[mbPart][subMbPart]` with mvd stored as `[x, y]`.
     /// Length 4 per partition (max case of 4x4 subdivision); shorter
     /// partitions populate only the first N entries.
-    pub mvd_l0: [Vec<[i32; 2]>; 4],
-    pub mvd_l1: [Vec<[i32; 2]>; 4],
+    pub mvd_l0: [PartList<[i32; 2]>; 4],
+    pub mvd_l1: [PartList<[i32; 2]>; 4],
 }
 
 // Required because `SubMbType` doesn't derive Default — but the fixed-
@@ -714,9 +785,9 @@ pub struct Macroblock {
     /// `Some` for the non-sub, non-PCM path.
     pub mb_pred: Option<MbPred>,
     /// `Some` when `NumMbPart == 4` and not an I_NxN / Intra_16x16 MB.
-    pub sub_mb_pred: Option<SubMbPred>,
+    pub sub_mb_pred: Option<Box<SubMbPred>>,
     /// `Some` for I_PCM.
-    pub pcm_samples: Option<PcmSamples>,
+    pub pcm_samples: Option<Box<PcmSamples>>,
     /// Derived `CodedBlockPattern` — bits 0..=3 luma, bits 4..=5 chroma.
     /// Equal to the Intra_16x16 derived values when that mb_type, and
     /// equal to 0 on P_Skip / B_Skip.
@@ -747,10 +818,10 @@ pub struct Macroblock {
     pub residual_cr_luma_like: Vec<[i32; 16]>,
     /// §7.3.5.3 — Cb Intra16x16 DC block when ChromaArrayType == 3 and
     /// mb_type is Intra_16x16.
-    pub residual_cb_16x16_dc: Option<[i32; 16]>,
+    pub residual_cb_16x16_dc: Option<Box<[i32; 16]>>,
     /// §7.3.5.3 — Cr Intra16x16 DC block when ChromaArrayType == 3 and
     /// mb_type is Intra_16x16.
-    pub residual_cr_16x16_dc: Option<[i32; 16]>,
+    pub residual_cr_16x16_dc: Option<Box<[i32; 16]>>,
     /// True if this entry represents a P_Skip / B_Skip MB, in which
     /// case none of the residual / pred fields carry meaningful data.
     pub is_skip: bool,
@@ -2769,11 +2840,11 @@ pub fn parse_macroblock_dp(
             mb_type_raw,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -2893,8 +2964,7 @@ pub fn parse_macroblock_dp(
     let direct_8x8_inference_flag = sps.direct_8x8_inference_flag;
     let no_sub_lt_8x8 = if let Some(sub) = sub_mb_pred.as_ref() {
         let mut flag = true;
-        for i in 0..4 {
-            let sub_t = sub.sub_mb_type[i];
+        for &sub_t in &sub.sub_mb_type {
             if matches!(sub_t, SubMbType::BDirect8x8) {
                 if !direct_8x8_inference_flag {
                     flag = false;
@@ -2964,7 +3034,7 @@ pub fn parse_macroblock_dp(
         mb_type: mb_type.clone(),
         mb_type_raw,
         mb_pred,
-        sub_mb_pred,
+        sub_mb_pred: sub_mb_pred.map(Box::new),
         pcm_samples: None,
         coded_block_pattern: cbp_total,
         transform_size_8x8_flag,
@@ -3535,7 +3605,7 @@ fn parse_sub_mb_pred(
     // Dispatch by slice kind (not `is_b`): a P/SP slice with `mb_type ==
     // P_8x8 / P_8x8ref0` uses the P binarisation (Table 9-37), while a B
     // slice with `mb_type == B_8x8` uses the B binarisation (Table 9-38).
-    for i in 0..4 {
+    for (i, sub_mb_type) in out.sub_mb_type.iter_mut().enumerate() {
         let raw = if let Some((dec, ctxs)) = entropy.cabac.as_mut() {
             match entropy.slice_kind {
                 crate::cabac_ctx::SliceKind::B => {
@@ -3550,7 +3620,7 @@ fn parse_sub_mb_pred(
         } else {
             r.ue()?
         };
-        out.sub_mb_type[i] = if is_b {
+        *sub_mb_type = if is_b {
             SubMbType::from_b(raw)?
         } else {
             SubMbType::from_p(raw)?
@@ -3558,7 +3628,7 @@ fn parse_sub_mb_pred(
         if dbg_on {
             eprintln!(
                 "[SUB {}] sub_mb_type[{}] raw={} -> {:?}",
-                entropy.current_mb_addr, i, raw, out.sub_mb_type[i]
+                entropy.current_mb_addr, i, raw, sub_mb_type
             );
         }
     }
@@ -4242,9 +4312,9 @@ fn parse_residual_cavlc_only(
                 );
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                 if plane_is_cr {
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cr_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 } else {
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cb_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 }
                 // §9.2.1.1 NOTE 1: DC counts do NOT contribute to nN.
             }
@@ -4890,10 +4960,10 @@ fn parse_residual_cabac_only(
                 )?;
                 if plane_is_cr {
                     curr_cbf.cbf_cr_16x16_dc = coded;
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cr_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 } else {
                     curr_cbf.cbf_cb_16x16_dc = coded;
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                    out.residual_cb_16x16_dc = Some(Box::new(pad_to_16(blk)));
                 }
             }
 
@@ -5449,9 +5519,9 @@ mod tests {
         assert_eq!(mb.coded_block_pattern, 0);
         // mb_pred should have filled the 8x8 flags, not the 4x4 ones.
         let pred = mb.mb_pred.expect("mb_pred present");
-        for i in 0..4 {
+        for (i, flag) in pred.prev_intra8x8_pred_mode_flag.iter().enumerate() {
             assert!(
-                pred.prev_intra8x8_pred_mode_flag[i],
+                *flag,
                 "prev_intra8x8_pred_mode_flag[{i}] should have been parsed as 1"
             );
         }
@@ -7369,8 +7439,8 @@ mod tests {
         assert!(mb.residual_cr_16x16_dc.is_some());
         // All 16 coefficients of each DC block are zero (TotalCoeff=0).
         assert_eq!(mb.residual_luma_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
         // No AC blocks (cbp_luma == 0 gates all planes).
         assert!(mb.residual_luma.is_empty());
         assert!(mb.residual_cb_luma_like.is_empty());

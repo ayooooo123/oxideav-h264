@@ -4,16 +4,21 @@
 //! Two coding paths sit behind one factory, chosen by the input pixel
 //! format and the `profile` option:
 //!
-//! * **8-bit 4:2:0** (`Yuv420P`, and `Gray8` coded as 4:2:0 with
-//!   constant chroma) — [`crate::encoder::session::EncoderSession`]:
-//!   IDR + P (+ B) GOPs, CAVLC (Baseline, 66) or CABAC (Main, 77),
-//!   three QP policies, MB-row rate control. Unchanged from round 420
-//!   (streams are byte-identical to earlier releases for the same
-//!   options).
+//! * **8-bit 4:2:0 and 8-bit grey** (`Yuv420P`, `Gray8`) —
+//!   [`crate::encoder::session::EncoderSession`]: IDR + P (+ B) GOPs,
+//!   CAVLC (Baseline, 66) or CABAC (Main, 77), three QP policies,
+//!   MB-row rate control. `Yuv420P` streams are unchanged from round
+//!   420 (byte-identical to earlier releases for the same options).
+//!   `Gray8` is coded **4:0:0** (`chroma_format_idc = 0`, luma only)
+//!   under High (100) — the lowest profile with a monochrome format,
+//!   §A.2.4 — with the same GOP structures and QP policies (per-picture
+//!   rate control without the MB-row modulation); `profile=baseline` /
+//!   `main` keep the older carriage as 4:2:0 with constant chroma.
 //! * **High-family layouts** (round 475) — 8-bit 4:2:2 / 4:4:4, and
 //!   10- / 12-bit 4:2:0 / 4:2:2 / 4:4:4 (`Yuv422P`, `Yuv444P`,
-//!   `Yuv420P10Le` … `Yuv444P12Le`, `Gray10Le` / `Gray12Le` as 4:2:0
-//!   with constant chroma) — [`crate::encoder::deep::DeepSession`]
+//!   `Yuv420P10Le` … `Yuv444P12Le`, `Gray10Le` / `Gray12Le` as 4:0:0,
+//!   and `Gray8` when a High-family tool or `profile=high` is asked
+//!   for) — [`crate::encoder::deep::DeepSession`]
 //!   under High (100) / High 10 (110) / High 4:2:2 (122) / High 4:4:4
 //!   Predictive (244) per §A.2.4 – §A.2.7: IDR + P GOPs (Intra_16x16 /
 //!   P_Skip / P_L0_16x16 with Intra_16x16 fallback), CAVLC or CABAC,
@@ -21,6 +26,11 @@
 //!   on/off, and **lossless** coding (`lossless=true`: SPS
 //!   `qpprime_y_zero_transform_bypass_flag`, QP′Y = 0, profile 244).
 //!   No B pictures and no rate control on this path.
+//!
+//! Picture sizes need not be whole macroblocks: any size on the
+//! §7.4.2.1.1 crop-unit grid of the coded chroma format (4:2:0 — even
+//! width and height; 4:2:2 — even width; 4:4:4 — any) is coded on a
+//! padded grid and restored by the SPS cropping rectangle.
 //!
 //! Every IDR access unit carries in-band SPS + PPS and a §7.4.3
 //! `idr_pic_id` that advances per IDR (0, 1, 2, … mod 65536), so
@@ -65,6 +75,7 @@ use crate::avcc::{AvcDecoderConfigurationRecord, annex_b_to_length_prefixed};
 use crate::encoder::deep::{
     DeepConfig, DeepPictureKind, DeepSession, min_profile_idc, profile_admits,
 };
+use crate::encoder::pad::CodedGeometry;
 use crate::encoder::rate_control::{RateControlConfig, RateControlMode};
 use crate::encoder::session::{EncoderSession, SessionConfig, SessionRateControl};
 use crate::transform::qp_bd_offset;
@@ -110,8 +121,9 @@ pub struct H264EncoderOptions {
     /// bypass at QP′Y = 0); the reconstruction equals the source
     /// sample-for-sample. High-family path; `qp` is ignored.
     pub lossless: bool,
-    /// Round-475 — High-profile 8x8 transform on P macroblocks
-    /// (4:2:0 / 4:2:2). High-family path.
+    /// Round-475 — High-profile 8x8 transform (4:0:0 / 4:2:0 / 4:2:2):
+    /// on P_L0_16x16 macroblocks and, with `intra_8x8` (round 488), as
+    /// Intra_8x8 macroblocks. High-family path.
     pub transform_8x8: bool,
     /// Round-475 — §8.7 in-loop deblocking (default true). High-family
     /// path (the 8-bit 4:2:0 path always deblocks).
@@ -120,6 +132,11 @@ pub struct H264EncoderOptions {
     /// the High-family path, competing with Intra_16x16 per macroblock
     /// (default true). The 8-bit 4:2:0 path runs its own RDO.
     pub intra_4x4: bool,
+    /// Round-488 — Intra_8x8 macroblocks (I_NxN with the 8x8 transform)
+    /// on the High-family path, competing with Intra_16x16 / Intra_4x4
+    /// per macroblock (default true). Takes effect with
+    /// `transform_8x8=true`, at 4:0:0 / 4:2:0 / 4:2:2.
+    pub intra_8x8: bool,
     /// Round-475 — packet framing: `annexb` (default: start codes,
     /// in-band SPS / PPS on every IDR, empty extradata) or `avcc`
     /// (4-byte length-prefixed NAL units without parameter sets /
@@ -150,6 +167,7 @@ impl Default for H264EncoderOptions {
             transform_8x8: false,
             deblock: true,
             intra_4x4: true,
+            intra_8x8: true,
             format: "annexb".to_string(),
         }
     }
@@ -223,7 +241,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             name: "transform_8x8",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
-            help: "High-profile 8x8 transform on P macroblocks (High-family path, 4:2:0 / 4:2:2)",
+            help: "High-profile 8x8 transform: P macroblocks and Intra_8x8 (High-family path, 4:0:0 / 4:2:0 / 4:2:2)",
         },
         OptionField {
             name: "deblock",
@@ -236,6 +254,12 @@ impl CodecOptionsStruct for H264EncoderOptions {
             kind: OptionKind::Bool,
             default: OptionValue::Bool(true),
             help: "Intra_4x4 (I_NxN) macroblocks in I pictures (High-family path)",
+        },
+        OptionField {
+            name: "intra_8x8",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "Intra_8x8 macroblocks (High-family path, with transform_8x8=true; 4:0:0 / 4:2:0 / 4:2:2)",
         },
         OptionField {
             name: "format",
@@ -260,6 +284,7 @@ impl CodecOptionsStruct for H264EncoderOptions {
             "transform_8x8" => self.transform_8x8 = value.as_bool()?,
             "deblock" => self.deblock = value.as_bool()?,
             "intra_4x4" => self.intra_4x4 = value.as_bool()?,
+            "intra_8x8" => self.intra_8x8 = value.as_bool()?,
             "format" => self.format = value.as_str()?.to_string(),
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -268,9 +293,10 @@ impl CodecOptionsStruct for H264EncoderOptions {
 }
 
 /// Pixel formats the encoder accepts as input, in the order the
-/// registry descriptor lists them. Grey inputs are coded as 4:2:0 with
-/// constant chroma (`1 << (BitDepth − 1)`); the output
-/// [`CodecParameters::pixel_format`] names the coded 4:2:0 layout.
+/// registry descriptor lists them. Grey inputs are coded 4:0:0 (the
+/// output [`CodecParameters::pixel_format`] is the grey format itself)
+/// except `Gray8` under `profile=baseline` / `main`, which is carried
+/// as 4:2:0 with constant chroma (`Yuv420P` out).
 pub fn accepted_pixel_formats() -> &'static [PixelFormat] {
     &[
         PixelFormat::Yuv420P,
@@ -294,6 +320,10 @@ struct Layout {
     /// Input chroma format (0 = grey input, no chroma planes).
     chroma_format_idc: u32,
     bit_depth: u32,
+    /// `chroma_format_idc` of the coded stream: the input's, except
+    /// grey input under `profile=baseline` / `main`, which is coded as
+    /// 4:2:0 with constant chroma (those profiles have no 4:0:0).
+    coded_chroma_format_idc: u32,
 }
 
 impl Layout {
@@ -316,6 +346,7 @@ impl Layout {
         Some(Self {
             chroma_format_idc: cf,
             bit_depth: bd,
+            coded_chroma_format_idc: cf,
         })
     }
 
@@ -328,14 +359,17 @@ impl Layout {
         self.bit_depth > 8
     }
 
-    /// `chroma_format_idc` of the coded stream (grey → 4:2:0).
+    /// `chroma_format_idc` of the coded stream.
     fn coded_chroma_format_idc(self) -> u32 {
-        self.chroma_format_idc.max(1)
+        self.coded_chroma_format_idc
     }
 
     /// Pixel format of the coded stream (what the decoder outputs).
     fn coded_pixel_format(self) -> PixelFormat {
         match (self.coded_chroma_format_idc(), self.bit_depth) {
+            (0, 8) => PixelFormat::Gray8,
+            (0, 10) => PixelFormat::Gray10Le,
+            (0, _) => PixelFormat::Gray12Le,
             (1, 8) => PixelFormat::Yuv420P,
             (2, 8) => PixelFormat::Yuv422P,
             (3, 8) => PixelFormat::Yuv444P,
@@ -351,6 +385,7 @@ impl Layout {
     /// Chroma plane dimensions of the coded stream.
     fn chroma_dims(self, w: usize, h: usize) -> (usize, usize) {
         match self.coded_chroma_format_idc() {
+            0 => (0, 0),
             1 => (w / 2, h / 2),
             2 => (w / 2, h),
             _ => (w, h),
@@ -432,6 +467,13 @@ pub struct H264CodecEncoder {
     /// `format=avcc`: length-prefixed samples without parameter sets.
     avcc: bool,
     queue: VecDeque<Packet>,
+    /// The construction parameters (options included): the base of a
+    /// mid-stream re-configuration.
+    params: CodecParameters,
+    /// Reorder mode: frames coded by earlier configurations, added to
+    /// the session's display index so `pts` keeps counting across a
+    /// re-configuration.
+    pts_base: i64,
 }
 
 /// Where a request is coded.
@@ -454,18 +496,28 @@ impl H264CodecEncoder {
         let height = params
             .height
             .ok_or_else(|| Error::invalid("h264 encoder requires height"))?;
-        if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
-            return Err(Error::invalid(format!(
-                "h264 encoder requires 16-aligned non-zero dimensions, got {width}x{height}"
-            )));
-        }
         let pf = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        let layout = Layout::of(pf).ok_or_else(|| {
+        let mut layout = Layout::of(pf).ok_or_else(|| {
             Error::unsupported(format!(
                 "h264 encoder input must be one of {:?}, got {pf:?}",
                 accepted_pixel_formats()
             ))
         })?;
+        // Grey input is coded 4:0:0 (a High-family format, §A.2.4);
+        // Baseline / Main, when asked for by name, carry it as 4:2:0
+        // with constant chroma.
+        if layout.gray()
+            && layout.bit_depth == 8
+            && matches!(opts.profile.as_str(), "baseline" | "main")
+        {
+            layout.coded_chroma_format_idc = 1;
+        }
+        // §7.4.2.1.1 — any size on the crop-unit grid of the coded
+        // chroma format is codable (padded to whole macroblocks, SPS
+        // cropping restores it); 4:2:0 needs even width and height,
+        // 4:2:2 an even width.
+        CodedGeometry::new(width, height, layout.coded_chroma_format_idc(), true)
+            .map_err(|e| Error::invalid(format!("h264 encoder: {width}x{height} {pf:?}: {e}")))?;
         if opts.gop == 0 {
             return Err(Error::invalid("gop must be >= 1"));
         }
@@ -487,7 +539,7 @@ impl H264CodecEncoder {
         // Route: the 8-bit 4:2:0 session unless the layout, an explicit
         // High-family profile, or a High-family-only tool asks for the
         // deep encoder.
-        let is_8bit_420 = layout.bit_depth == 8 && layout.coded_chroma_format_idc() == 1;
+        let is_8bit_420 = layout.bit_depth == 8 && layout.coded_chroma_format_idc() <= 1;
         let coded_cf = layout.coded_chroma_format_idc();
         let bd = layout.bit_depth;
         let high_tools = opts.lossless || opts.transform_8x8 || !opts.deblock;
@@ -614,6 +666,7 @@ impl H264CodecEncoder {
                     b_frames: opts.bframes,
                     rate_control,
                     recovery_point_sei: false,
+                    monochrome: coded_cf == 0,
                 });
                 if target_bitrate > 0 && mode.is_some() {
                     output_params.bit_rate = Some(u64::from(target_bitrate));
@@ -672,7 +725,8 @@ impl H264CodecEncoder {
                     },
                     profile_idc,
                 )
-                .with_intra_4x4(opts.intra_4x4);
+                .with_intra_4x4(opts.intra_4x4)
+                .with_intra_8x8(opts.intra_8x8);
                 let ps = session.parameter_sets_annex_b();
                 (
                     Backend::Deep(Box::new(DeepDriver {
@@ -710,7 +764,76 @@ impl H264CodecEncoder {
             decode_index: 0,
             avcc,
             queue: VecDeque::new(),
+            params: params.clone(),
+            pts_base: 0,
         })
+    }
+
+    /// The `idr_pic_id` the next IDR of the current backend carries.
+    fn next_idr_pic_id(&self) -> u32 {
+        match &self.backend {
+            Backend::Session(s) => s.next_idr_pic_id(),
+            Backend::Deep(d) => d.next_idr_pic_id,
+        }
+    }
+
+    /// `Frame::StreamParams`: re-configure for a new input shape.
+    ///
+    /// The width / height / pixel format / frame rate the event states
+    /// replace those of the construction parameters (options kept), a
+    /// new coding path is built for them, the old one is drained (its
+    /// B-frame tail comes out first), and the next frame starts a new
+    /// coded video sequence: an IDR access unit carrying the new SPS +
+    /// PPS in band (§7.4.1.2.1 — an SPS may change content only ahead
+    /// of an IDR), whose `idr_pic_id` continues the old sequence's
+    /// (§7.4.3). `pts` / `dts` keep counting. An event that changes
+    /// nothing is a no-op.
+    ///
+    /// `format=avcc` cannot follow (its parameter sets live in the
+    /// `extradata` record, fixed for the stream): `Error::Unsupported`,
+    /// as is a shape no coding path takes (a size off the chroma
+    /// sampling grid, an unsupported layout); the encoder is unchanged
+    /// then.
+    fn reconfigure(&mut self, ev: &CodecParameters) -> Result<()> {
+        let mut next = self.params.clone();
+        next.width = ev.width.or(next.width);
+        next.height = ev.height.or(next.height);
+        next.pixel_format = ev.pixel_format.or(next.pixel_format);
+        next.frame_rate = ev.frame_rate.or(next.frame_rate);
+        let cur = &self.params;
+        let input_pf = |p: &CodecParameters| p.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        if (next.width, next.height, next.frame_rate) == (cur.width, cur.height, cur.frame_rate)
+            && input_pf(&next) == input_pf(cur)
+        {
+            return Ok(());
+        }
+        if self.avcc {
+            return Err(Error::unsupported(
+                "h264 encoder: format=avcc cannot change shape mid-stream (parameter sets are fixed in the extradata record)",
+            ));
+        }
+        let mut fresh = Self::new(&next).map_err(|e| {
+            Error::unsupported(format!(
+                "h264 encoder: cannot re-configure for {next:?}: {e}"
+            ))
+        })?;
+        // Drain the old configuration's buffered tail first.
+        self.flush()?;
+        let idr_pic_id = self.next_idr_pic_id();
+        match &mut fresh.backend {
+            Backend::Session(s) => s.set_next_idr_pic_id(idr_pic_id),
+            Backend::Deep(d) => d.next_idr_pic_id = idr_pic_id,
+        }
+        self.backend = fresh.backend;
+        self.layout = fresh.layout;
+        self.width = fresh.width;
+        self.height = fresh.height;
+        self.time_base = fresh.time_base;
+        self.reordered = fresh.reordered;
+        self.output_params = fresh.output_params;
+        self.params = next;
+        self.pts_base = self.frame_index;
+        Ok(())
     }
 
     /// Package one access unit as a packet on the queue.
@@ -741,7 +864,10 @@ impl H264CodecEncoder {
             let (pts, dts) = if self.reordered {
                 // Frame-duration units: display slot + the one-frame
                 // reorder latency vs the decode counter.
-                (sf.display_index as i64 + 1, self.decode_index)
+                (
+                    self.pts_base + sf.display_index as i64 + 1,
+                    self.decode_index,
+                )
             } else {
                 (input_pts, input_pts)
             };
@@ -800,6 +926,7 @@ impl CoreEncoder for H264CodecEncoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(vf) => vf,
+            Frame::StreamParams(p) => return self.reconfigure(p),
             _ => return Err(Error::invalid("h264 encoder accepts video frames only")),
         };
         let planes = vf.image_planes();
@@ -819,6 +946,7 @@ impl CoreEncoder for H264CodecEncoder {
             Backend::Session(session) => {
                 let y = Self::packed_plane(&planes[0], w, h)?;
                 let (u, v) = if self.layout.gray() {
+                    // Empty at 4:0:0 (`cw * ch == 0`).
                     (vec![128u8; cw * ch], vec![128u8; cw * ch])
                 } else {
                     (

@@ -21,6 +21,8 @@
 
 use std::sync::OnceLock;
 
+use crate::sample_plane::{Sample, Samples, SamplesRef};
+
 /// Largest window a kernel gathers: a 16x16 luma block plus the
 /// 6-tap filter margins (2 before, 3 after) in each direction.
 const WIN: usize = 21;
@@ -31,7 +33,7 @@ pub(crate) enum PlaneSrc<'a> {
     /// A flat row-major plane: row `y` starts at `data[y * stride]`.
     /// A field of a frame is a flat plane with a doubled stride.
     Flat {
-        data: &'a [i32],
+        data: SamplesRef<'a>,
         stride: usize,
         width: usize,
         height: usize,
@@ -41,7 +43,7 @@ pub(crate) enum PlaneSrc<'a> {
     /// reads must already be published.
     #[cfg_attr(not(test), allow(dead_code))]
     Banded {
-        bands: &'a [OnceLock<Box<[i32]>>],
+        bands: &'a [OnceLock<Samples>],
         band_rows: usize,
         width: usize,
         height: usize,
@@ -65,14 +67,14 @@ impl<'a> PlaneSrc<'a> {
 
     /// Row `y` (`y < height`), `width` samples long.
     #[inline]
-    fn row(&self, y: usize) -> &'a [i32] {
+    fn row(&self, y: usize) -> SamplesRef<'a> {
         match *self {
             PlaneSrc::Flat {
                 data,
                 stride,
                 width,
                 ..
-            } => &data[y * stride..y * stride + width],
+            } => data.slice(y * stride..y * stride + width),
             PlaneSrc::Banded {
                 bands,
                 band_rows,
@@ -83,7 +85,7 @@ impl<'a> PlaneSrc<'a> {
                     .get()
                     .expect("reference band read before it was published");
                 let o = (y % band_rows) * width;
-                &band[o..o + width]
+                band.slice(o..o + width)
             }
         }
     }
@@ -92,7 +94,7 @@ impl<'a> PlaneSrc<'a> {
 /// Gather the `ww`x`wh` window whose top-left integer sample is
 /// `(x0, y0)` into `out` (row stride `ostride`), clamping every
 /// coordinate into the plane (eqs. 8-239 / 8-240, 8-262..8-269).
-#[inline(always)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn gather(
     src: &PlaneSrc<'_>,
@@ -106,44 +108,146 @@ fn gather(
     let width = src.width() as i32;
     let ymax = src.height() as i32 - 1;
     let inside_x = x0 >= 0 && x0 + ww as i32 <= width;
-    for r in 0..wh {
-        let y = (y0 + r as i32).clamp(0, ymax) as usize;
-        let row = src.row(y);
-        let o = &mut out[r * ostride..r * ostride + ww];
-        if inside_x {
-            copy_short(o, &row[x0 as usize..x0 as usize + ww]);
-        } else {
-            for (c, slot) in o.iter_mut().enumerate() {
-                *slot = row[(x0 + c as i32).clamp(0, width - 1) as usize];
+    match *src {
+        PlaneSrc::Flat {
+            data: SamplesRef::U8(d),
+            stride,
+            ..
+        } => gather_flat(
+            d, stride, x0, y0, ww, wh, width, ymax, inside_x, out, ostride,
+        ),
+        PlaneSrc::Flat {
+            data: SamplesRef::U16(d),
+            stride,
+            ..
+        } => gather_flat(
+            d, stride, x0, y0, ww, wh, width, ymax, inside_x, out, ostride,
+        ),
+        PlaneSrc::Banded { .. } => {
+            for r in 0..wh {
+                let y = (y0 + r as i32).clamp(0, ymax) as usize;
+                let o = &mut out[r * ostride..r * ostride + ww];
+                match src.row(y) {
+                    SamplesRef::U8(row) => gather_row(row, x0, width, inside_x, o),
+                    SamplesRef::U16(row) => gather_row(row, x0, width, inside_x, o),
+                }
             }
         }
     }
 }
 
-/// `dst.copy_from_slice(src)` for the short rows of a block window.
+/// [`gather`] from a flat plane (`d`, rows `stride` apart).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gather_flat<S: Sample>(
+    d: &[S],
+    stride: usize,
+    x0: i32,
+    y0: i32,
+    ww: usize,
+    wh: usize,
+    width: i32,
+    ymax: i32,
+    inside_x: bool,
+    out: &mut [i32],
+    ostride: usize,
+) {
+    if inside_x && y0 >= 0 && y0 + wh as i32 - 1 <= ymax {
+        let base = y0 as usize * stride + x0 as usize;
+        // Rows of the block lengths the kernels use as fixed-size
+        // widening copies (the row length dispatched once).
+        #[inline(always)]
+        fn rows<const N: usize, S: Sample>(
+            d: &[S],
+            base: usize,
+            stride: usize,
+            wh: usize,
+            out: &mut [i32],
+            ostride: usize,
+        ) {
+            for r in 0..wh {
+                let src: &[S; N] = d[base + r * stride..][..N].try_into().expect("row");
+                let dst: &mut [i32; N] = (&mut out[r * ostride..][..N]).try_into().expect("row");
+                for (o, v) in dst.iter_mut().zip(src) {
+                    *o = v.get();
+                }
+            }
+        }
+        match ww {
+            2 => rows::<2, S>(d, base, stride, wh, out, ostride),
+            4 => rows::<4, S>(d, base, stride, wh, out, ostride),
+            8 => rows::<8, S>(d, base, stride, wh, out, ostride),
+            9 => rows::<9, S>(d, base, stride, wh, out, ostride),
+            16 => rows::<16, S>(d, base, stride, wh, out, ostride),
+            17 => rows::<17, S>(d, base, stride, wh, out, ostride),
+            21 => rows::<21, S>(d, base, stride, wh, out, ostride),
+            _ => {
+                for r in 0..wh {
+                    copy_short(
+                        &mut out[r * ostride..r * ostride + ww],
+                        &d[base + r * stride..],
+                    );
+                }
+            }
+        }
+        return;
+    }
+    for r in 0..wh {
+        let y = (y0 + r as i32).clamp(0, ymax) as usize;
+        let row = &d[y * stride..y * stride + width as usize];
+        gather_row(
+            row,
+            x0,
+            width,
+            inside_x,
+            &mut out[r * ostride..r * ostride + ww],
+        );
+    }
+}
+
+/// One row of [`gather`]: samples `x0..x0 + o.len()` of `row`, each
+/// coordinate clamped into `0..width` when the run leaves the row.
+#[inline(always)]
+fn gather_row<S: Sample>(row: &[S], x0: i32, width: i32, inside_x: bool, o: &mut [i32]) {
+    if inside_x {
+        copy_short(o, &row[x0 as usize..x0 as usize + o.len()]);
+    } else {
+        for (c, slot) in o.iter_mut().enumerate() {
+            *slot = row[(x0 + c as i32).clamp(0, width - 1) as usize].get();
+        }
+    }
+}
+
+/// Widen `src` into `dst` for the short rows of a block window.
 /// The row lengths a kernel uses are dispatched to fixed-size copies,
 /// which compile to a few loads and stores (a library `memcpy` call per
 /// row costs more than the copy itself at these lengths).
 #[inline(always)]
-fn copy_short(dst: &mut [i32], src: &[i32]) {
+fn copy_short<S: Sample>(dst: &mut [i32], src: &[S]) {
     #[inline(always)]
-    fn fixed<const N: usize>(dst: &mut [i32], src: &[i32]) {
+    fn fixed<const N: usize, S: Sample>(dst: &mut [i32], src: &[S]) {
         let d: &mut [i32; N] = (&mut dst[..N]).try_into().expect("row length");
-        let s: &[i32; N] = (&src[..N]).try_into().expect("row length");
-        *d = *s;
+        let s: &[S; N] = (&src[..N]).try_into().expect("row length");
+        for (d, s) in d.iter_mut().zip(s) {
+            *d = s.get();
+        }
     }
     match dst.len() {
-        2 => fixed::<2>(dst, src),
-        3 => fixed::<3>(dst, src),
-        4 => fixed::<4>(dst, src),
-        5 => fixed::<5>(dst, src),
-        8 => fixed::<8>(dst, src),
-        9 => fixed::<9>(dst, src),
-        13 => fixed::<13>(dst, src),
-        16 => fixed::<16>(dst, src),
-        17 => fixed::<17>(dst, src),
-        21 => fixed::<21>(dst, src),
-        n => dst.copy_from_slice(&src[..n]),
+        2 => fixed::<2, S>(dst, src),
+        3 => fixed::<3, S>(dst, src),
+        4 => fixed::<4, S>(dst, src),
+        5 => fixed::<5, S>(dst, src),
+        8 => fixed::<8, S>(dst, src),
+        9 => fixed::<9, S>(dst, src),
+        13 => fixed::<13, S>(dst, src),
+        16 => fixed::<16, S>(dst, src),
+        17 => fixed::<17, S>(dst, src),
+        21 => fixed::<21, S>(dst, src),
+        n => {
+            for (d, s) in dst.iter_mut().zip(&src[..n]) {
+                *d = s.get();
+            }
+        }
     }
 }
 
@@ -154,14 +258,15 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 
 #[inline(always)]
 fn clip1(v: i32, max_v: i32) -> i32 {
-    v.clamp(0, max_v)
+    // (min / max rather than `clamp`: no bound-order check, so the
+    // kernels vectorise.)
+    v.max(0).min(max_v)
 }
 
 /// §8.4.2.2.1 — predict a `w`x`h` luma block (`w`, `h` ≤ 16) at the
 /// integer position `(int_x, int_y)` with quarter-sample offset
 /// `(x_frac, y_frac)` (each 0..=3), writing `dst[y * dst_stride + x]`.
 #[allow(clippy::too_many_arguments)]
-#[inline]
 pub(crate) fn luma(
     src: &PlaneSrc<'_>,
     int_x: i32,
@@ -175,57 +280,6 @@ pub(crate) fn luma(
     dst_stride: usize,
 ) {
     debug_assert!(w <= 16 && h <= 16 && x_frac < 4 && y_frac < 4);
-    if let PlaneSrc::Flat {
-        data,
-        stride,
-        width,
-        height,
-    } = *src
-    {
-        let bit_depth = (max_v as u32 + 1).trailing_zeros();
-        if matches!(bit_depth, 8..=14)
-            && crate::simd::chunked::interpolate_luma(
-                data, stride, width, height, int_x, int_y, x_frac, y_frac, w as u32, h as u32,
-                bit_depth, dst, dst_stride,
-            )
-            .is_ok()
-        {
-            return;
-        }
-    } else if let PlaneSrc::Banded {
-        bands,
-        band_rows,
-        width,
-        height,
-    } = *src
-    {
-        let y_min = if x_frac == 0 && y_frac == 0 { int_y } else { int_y - 2 };
-        let y_max = if x_frac == 0 && y_frac == 0 {
-            int_y + h as i32 - 1
-        } else {
-            int_y + h as i32 + 2
-        };
-        if y_min >= 0 && (y_max as usize) < height {
-            let b0 = (y_min as usize) / band_rows;
-            let b1 = (y_max as usize) / band_rows;
-            let bit_depth = (max_v as u32 + 1).trailing_zeros();
-            if b0 == b1
-                && matches!(bit_depth, 8..=14)
-                && let Some(band) = bands[b0].get()
-            {
-                let band_h = band.len() / width;
-                let local_y = int_y - (b0 * band_rows) as i32;
-                if crate::simd::chunked::interpolate_luma(
-                    band, width, width, band_h, int_x, local_y, x_frac, y_frac, w as u32, h as u32,
-                    bit_depth, dst, dst_stride,
-                )
-                .is_ok()
-                {
-                    return;
-                }
-            }
-        }
-    }
     if x_frac == 0 && y_frac == 0 {
         // Table 8-12 — G: the integer samples themselves.
         gather(src, int_x, int_y, w, h, dst, dst_stride);
@@ -234,6 +288,31 @@ pub(crate) fn luma(
     let ws = w + 5;
     let mut win = [0i32; WIN * WIN];
     gather(src, int_x - 2, int_y - 2, ws, h + 5, &mut win, ws);
+    // The NEON / WASM SIMD kernels run on the gathered window: the
+    // block sits at (2, 2) of it with every filter tap inside.
+    if w.is_multiple_of(4) && h.is_multiple_of(4) {
+        let bit_depth = (max_v as u32 + 1).trailing_zeros();
+        if matches!(bit_depth, 8..=14)
+            && crate::simd::chunked::interpolate_luma(
+                &win,
+                ws,
+                ws,
+                h + 5,
+                2,
+                2,
+                x_frac,
+                y_frac,
+                w as u32,
+                h as u32,
+                bit_depth,
+                dst,
+                dst_stride,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
     // G at (x, y) of the block is win[(y + 2) * ws + x + 2].
     let g = |x: usize, y: usize| win[(y + 2) * ws + x + 2];
     // eq. 8-241 — b1 at (x, y + dy) (dy = 0: b, dy = 1: s).
@@ -366,50 +445,6 @@ pub(crate) fn chroma(
     dst_stride: usize,
 ) {
     debug_assert!(w <= 16 && h <= 16 && x_frac < 8 && y_frac < 8);
-    if let PlaneSrc::Flat {
-        data,
-        stride,
-        width,
-        height,
-    } = *src
-    {
-        if crate::simd::chunked::interpolate_chroma(
-            data, stride, width, height, int_x, int_y, x_frac, y_frac, w as u32, h as u32, 8, dst,
-            dst_stride,
-        )
-        .is_ok()
-        {
-            return;
-        }
-    } else if let PlaneSrc::Banded {
-        bands,
-        band_rows,
-        width,
-        height,
-    } = *src
-    {
-        let y_max = if x_frac == 0 && y_frac == 0 {
-            int_y + h as i32 - 1
-        } else {
-            int_y + h as i32
-        };
-        if int_y >= 0 && (y_max as usize) < height {
-            let b0 = (int_y as usize) / band_rows;
-            let b1 = (y_max as usize) / band_rows;
-            if b0 == b1 && let Some(band) = bands[b0].get() {
-                let band_h = band.len() / width;
-                let local_y = int_y - (b0 * band_rows) as i32;
-                if crate::simd::chunked::interpolate_chroma(
-                    band, width, width, band_h, int_x, local_y, x_frac, y_frac, w as u32, h as u32,
-                    8, dst, dst_stride,
-                )
-                .is_ok()
-                {
-                    return;
-                }
-            }
-        }
-    }
     if x_frac == 0 && y_frac == 0 {
         gather(src, int_x, int_y, w, h, dst, dst_stride);
         return;
@@ -417,6 +452,27 @@ pub(crate) fn chroma(
     let ws = w + 1;
     let mut win = [0i32; 17 * 17];
     gather(src, int_x, int_y, ws, h + 1, &mut win, ws);
+    // The NEON / WASM SIMD kernel on the gathered window (the block at
+    // its origin, the right and bottom neighbours inside).
+    if crate::simd::chunked::interpolate_chroma(
+        &win,
+        ws,
+        ws,
+        h + 1,
+        0,
+        0,
+        x_frac,
+        y_frac,
+        w as u32,
+        h as u32,
+        8,
+        dst,
+        dst_stride,
+    )
+    .is_ok()
+    {
+        return;
+    }
     let xf = x_frac as i32;
     let yf = y_frac as i32;
     let c00 = (8 - xf) * (8 - yf);
@@ -455,17 +511,18 @@ mod tests {
     fn luma_and_chroma_match_reference_interpolators() {
         let (pw, ph) = (40usize, 36usize);
         let data = plane(pw, ph, 7);
-        let bands: Vec<OnceLock<Box<[i32]>>> = data
+        let stored = Samples::from_i32(&data, 8);
+        let bands: Vec<OnceLock<Samples>> = data
             .chunks(pw * 4)
             .map(|c| {
                 let l = OnceLock::new();
-                let _ = l.set(c.to_vec().into_boxed_slice());
+                let _ = l.set(Samples::from_i32(c, 8));
                 l
             })
             .collect();
         let srcs = [
             PlaneSrc::Flat {
-                data: &data,
+                data: stored.as_ref(),
                 stride: pw,
                 width: pw,
                 height: ph,

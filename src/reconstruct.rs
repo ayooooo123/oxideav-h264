@@ -35,8 +35,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    BsInputs, EdgeSamples, FilterParams, Plane, alpha_from_index, beta_from_index,
-    derive_boundary_strength, filter_edge, tc0_from,
+    BsInputs, EDGE_LINES, EdgeFilter, EdgeLines, EdgeSamples, FilterParams, Plane,
+    alpha_from_index, beta_from_index, derive_boundary_strength, edge_alpha_beta, filter_edge,
+    filter_lines_chroma, filter_lines_luma, tc0_from, tc0_lanes,
 };
 use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
@@ -47,13 +48,13 @@ use crate::intra_pred::{
 use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
-    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
-    derive_median_mvpred, derive_mvpred_with_d, derive_p_skip_mv_with_d,
+    Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_median_mvpred, derive_mvpred_with_d,
+    derive_p_skip_mv_with_d,
 };
 use crate::picture::Picture;
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
-use crate::simd::interpolate_luma;
+use crate::sample_plane::{Sample, Samples, SamplesMut, SamplesRef};
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sp_transform::{
@@ -61,7 +62,7 @@ use crate::sp_transform::{
 };
 use crate::sps::Sps;
 use crate::transform::{
-    TransformError, intra_bypass_dpcm, inverse_hadamard_chroma_dc_420,
+    FLAT_4X4_16, TransformError, intra_bypass_dpcm, inverse_hadamard_chroma_dc_420,
     inverse_hadamard_chroma_dc_422, inverse_hadamard_luma_dc_16x16, inverse_transform_4x4,
     inverse_transform_4x4_dc_preserved, inverse_transform_8x8, qp_bd_offset,
     qp_y_to_qp_c_with_bd_offset, select_scaling_list_4x4, select_scaling_list_8x8,
@@ -591,7 +592,7 @@ impl MbWriter {
             let wu = w as usize;
             for y in 0..16usize {
                 let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
-                pic.luma[o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
+                pic.luma.write_i32(o, &samples[y * 16..y * 16 + 16]);
             }
         } else {
             for y in 0..16 {
@@ -634,7 +635,7 @@ impl MbWriter {
             let dst = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
             for y in 0..h {
                 let o = (y0 as usize + y * ys as usize) * cw as usize + x0 as usize;
-                dst[o..o + w].copy_from_slice(&samples[y * w..y * w + w]);
+                dst.write_i32(o, &samples[y * w..y * w + w]);
             }
         } else {
             for y in 0..h {
@@ -816,6 +817,7 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
                 // scaling lists of ITS colour plane (colour_plane_id).
                 luma_scaling_plane(sps, slice_header),
                 sp_si_ctx,
+                IntraPass::Samples,
             )?;
         } else {
             reconstruct_mb_inter(
@@ -973,7 +975,11 @@ fn synth_mb_inter<R: RefPicProvider>(
     pps: &Pps,
     ref_pics: &R,
     curr_poc: i32,
-    scratch: &mut Picture,
+    // Where the macroblock is written: `out` with the macroblock's
+    // top-left luma sample at `origin` (a one-macroblock scratch picture
+    // at (0, 0), or the picture itself at the macroblock's position).
+    out: &mut Picture,
+    origin: (i32, i32),
 ) -> Result<(), ReconstructError> {
     let mb_px = job.mb_x as i32 * 16;
     let mb_py = job.mb_y as i32 * 16;
@@ -1014,14 +1020,13 @@ fn synth_mb_inter<R: RefPicProvider>(
             None,
         )?;
     }
-    // The scratch picture is the macroblock itself: origin (0, 0).
     let writer = MbWriter {
-        mb_px: 0,
-        mb_py: 0,
+        mb_px: origin.0,
+        mb_py: origin.1,
         mb_field: false,
         mbaff_frame: false,
-        pair_px: 0,
-        pair_py: 0,
+        pair_px: origin.0,
+        pair_py: origin.1,
         mb_is_top: true,
         chroma_array_type,
     };
@@ -1037,10 +1042,10 @@ fn synth_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         pred_cb,
         pred_cr,
-        scratch,
+        out,
         false,
         false,
     )
@@ -1050,9 +1055,9 @@ fn synth_mb_inter<R: RefPicProvider>(
 /// worker of the inter sample stage.
 struct MbRowBand<'a> {
     mb_y: u32,
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: SamplesMut<'a>,
+    cb: SamplesMut<'a>,
+    cr: SamplesMut<'a>,
 }
 
 /// Whether [`reconstruct_slice_no_deblock_threaded`] can split this
@@ -1211,18 +1216,18 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
     }
     let mut bands: Vec<Option<MbRowBand<'_>>> = Vec::new();
     {
-        let mut luma_rest: &mut [i32] = &mut pic.luma;
-        let mut cb_rest: &mut [i32] = &mut pic.cb;
-        let mut cr_rest: &mut [i32] = &mut pic.cr;
+        let mut luma_rest = pic.luma.as_mut();
+        let mut cb_rest = pic.cb.as_mut();
+        let mut cr_rest = pic.cr.as_mut();
         let mut consumed_rows = 0u32;
         for (mb_y, _) in &rows {
             let skip = (*mb_y - consumed_rows) as usize;
-            luma_rest = &mut std::mem::take(&mut luma_rest)[skip * 16 * width..];
-            cb_rest = &mut std::mem::take(&mut cb_rest)[skip * mbh_c * cw..];
-            cr_rest = &mut std::mem::take(&mut cr_rest)[skip * mbh_c * cw..];
-            let (l, lr) = std::mem::take(&mut luma_rest).split_at_mut(16 * width);
-            let (b, br) = std::mem::take(&mut cb_rest).split_at_mut(mbh_c * cw);
-            let (r, rr) = std::mem::take(&mut cr_rest).split_at_mut(mbh_c * cw);
+            luma_rest = luma_rest.into_tail(skip * 16 * width);
+            cb_rest = cb_rest.into_tail(skip * mbh_c * cw);
+            cr_rest = cr_rest.into_tail(skip * mbh_c * cw);
+            let (l, lr) = luma_rest.split_at(16 * width);
+            let (b, br) = cb_rest.split_at(mbh_c * cw);
+            let (r, rr) = cr_rest.split_at(mbh_c * cw);
             luma_rest = lr;
             cb_rest = br;
             cr_rest = rr;
@@ -1251,7 +1256,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                     if k >= rows.len() {
                         break;
                     }
-                    let band = bands.lock().unwrap_or_else(|e| e.into_inner())[k]
+                    let mut band = bands.lock().unwrap_or_else(|e| e.into_inner())[k]
                         .take()
                         .expect("row band taken once");
                     debug_assert_eq!(band.mb_y, rows[k].0);
@@ -1268,6 +1273,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                             ref_pics,
                             curr_poc,
                             &mut scratch,
+                            (0, 0),
                         ) {
                             let mut slot = errors.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.as_ref().is_none_or(|(i, _)| job.idx < *i) {
@@ -1277,15 +1283,20 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                         }
                         let x0 = job.mb_x as usize * 16;
                         for y in 0..16 {
-                            band.luma[y * width + x0..y * width + x0 + 16]
-                                .copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
+                            band.luma
+                                .slice_mut(y * width + x0..y * width + x0 + 16)
+                                .copy_from(scratch.luma.slice(y * 16..y * 16 + 16));
                         }
                         let cx0 = job.mb_x as usize * mbw_c;
                         for y in 0..mbh_c {
                             let d = y * cw + cx0;
                             let s = y * mbw_c;
-                            band.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
-                            band.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
+                            band.cb
+                                .slice_mut(d..d + mbw_c)
+                                .copy_from(scratch.cb.slice(s..s + mbw_c));
+                            band.cr
+                                .slice_mut(d..d + mbw_c)
+                                .copy_from(scratch.cr.slice(s..s + mbw_c));
                         }
                     }
                 }
@@ -1321,6 +1332,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
             field_scan,
             luma_scaling_plane(sps, slice_header),
             None,
+            IntraPass::Samples,
         )?;
     }
     match failed {
@@ -1650,6 +1662,10 @@ fn reconstruct_mb_intra(
     // §8.6 — Some for MBs of SP/SI slices; the SI macroblock type
     // reconstructs through §8.6.2 with QSY/QSC.
     sp_si: Option<SpSiCtx>,
+    // Only the decoding-order part: the grid bookkeeping and every
+    // check that can reject the macroblock, without predicting or
+    // writing samples (`pic` is only read).
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // §6.4.1 — MB sample origin (non-MBAFF eqs. 6-3/6-4 or MBAFF eqs.
     // 6-5..6-10 depending on `mb_field_decoding_flag`).
@@ -1686,6 +1702,9 @@ fn reconstruct_mb_intra(
             let pcm = mb.pcm_samples.as_ref().ok_or_else(|| {
                 ReconstructError::UnsupportedMbType("I_PCM without samples".into())
             })?;
+            if dry == IntraPass::Checks {
+                return Ok(());
+            }
             for y in 0..16 {
                 for x in 0..16 {
                     let v = pcm.luma[(y * 16 + x) as usize] as i32;
@@ -1733,6 +1752,7 @@ fn reconstruct_mb_intra(
                 grid,
                 current_slice_id,
                 field_scan,
+                dry,
             )?;
         }
         MbType::INxN | MbType::SI => {
@@ -1764,6 +1784,7 @@ fn reconstruct_mb_intra(
                 current_slice_id,
                 field_scan,
                 si_qs,
+                dry,
             )?;
             if chroma_array_type == 3 {
                 // §8.3.4.5 — 4:4:4 I_NxN: Cb/Cr coded like luma, reusing
@@ -1800,6 +1821,7 @@ fn reconstruct_mb_intra(
                     current_slice_id,
                     field_scan,
                     si_qs,
+                    dry,
                 )?;
             }
         }
@@ -1813,6 +1835,15 @@ fn reconstruct_mb_intra(
         }
     }
     Ok(())
+}
+
+/// What [`reconstruct_mb_intra`] does: the whole §8.3 / §8.5
+/// reconstruction, or only its decoding-order part (grid bookkeeping
+/// and every check that can reject the macroblock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntraPass {
+    Samples,
+    Checks,
 }
 
 // -------------------------------------------------------------------------
@@ -1840,6 +1871,7 @@ fn reconstruct_intra_16x16(
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // -------- §8.3.3 — 16x16 prediction -----------------------------
     let samples = gather_samples_16x16(
@@ -1855,6 +1887,30 @@ fn reconstruct_intra_16x16(
         ReconstructError::UnsupportedMbType(format!("Intra_16x16 pred_mode {}", pred_mode_idx))
     })?;
     require_intra_16x16_mode(mode, &samples.availability)?;
+    if dry == IntraPass::Checks {
+        let qp_prime_y = qp_y + qp_bd_offset(sps.bit_depth_luma_minus8);
+        if !transform_bypass_active(sps, qp_prime_y) {
+            crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+        }
+        return reconstruct_chroma_intra(
+            mb,
+            qp_y,
+            chroma_array_type,
+            bit_depth_c,
+            mb_px,
+            mb_py,
+            mb_addr,
+            writer,
+            sps,
+            pps,
+            pic,
+            grid,
+            current_slice_id,
+            field_scan,
+            None,
+            dry,
+        );
+    }
     let mut pred = [0i32; 256];
     predict_16x16(mode, &samples, bit_depth_y, &mut pred);
 
@@ -1968,6 +2024,7 @@ fn reconstruct_intra_16x16(
         current_slice_id,
         field_scan,
         None,
+        IntraPass::Samples,
     )?;
 
     Ok(())
@@ -2604,6 +2661,7 @@ fn reconstruct_intra_nxn(
     // run through §8.5.12 at qP = QSY; the output samples are
     // Clip1Y(rij) (eq. 8-434) with no second prediction add.
     si_switch_qs: Option<i32>,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     let pred = mb
         .mb_pred
@@ -2687,6 +2745,15 @@ fn reconstruct_intra_nxn(
                 by,
             );
             require_intra_8x8_mode(mode, &raw.availability)?;
+            if dry == IntraPass::Checks {
+                if !bypass {
+                    crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+                }
+                if let Some(info) = grid.get_mut(mb_addr) {
+                    info.intra_8x8_pred_modes[blk8] = mode.as_index();
+                }
+                continue;
+            }
             let filtered = filter_samples_8x8(&raw, bit_depth_y);
             let mut pred_samples = [0i32; 64];
             predict_8x8(mode, &filtered, bit_depth_y, &mut pred_samples);
@@ -2817,6 +2884,15 @@ fn reconstruct_intra_nxn(
                 by,
             );
             require_intra_4x4_mode(mode, &samples.availability)?;
+            if dry == IntraPass::Checks && si_switch_qs.is_none() {
+                if !bypass {
+                    crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
+                }
+                if let Some(info) = grid.get_mut(mb_addr) {
+                    info.intra_4x4_pred_modes[block_idx] = mode.as_index();
+                }
+                continue;
+            }
             let mut pred_samples = [0i32; 16];
             predict_4x4(mode, &samples, bit_depth_y, &mut pred_samples);
 
@@ -2939,6 +3015,7 @@ fn reconstruct_chroma_intra(
     // chroma prediction is re-routed through the transform-domain
     // reconstruction at QSC (derived from QSY via §8.5.8).
     si_switch_qs: Option<i32>,
+    dry: IntraPass,
 ) -> Result<(), ReconstructError> {
     // Monochrome: no chroma work to do.
     if chroma_array_type == 0 {
@@ -3049,6 +3126,13 @@ fn reconstruct_chroma_intra(
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         require_intra_chroma_mode(chroma_mode, &samples.availability)?;
+        if dry == IntraPass::Checks && si_switch_qs.is_none() {
+            if !bypass {
+                let qp_c = if plane == 0 { qp_cb } else { qp_cr };
+                crate::transform::check_transform_params(qp_c, bit_depth_c)?;
+            }
+            continue;
+        }
         let mut pred_samples = vec![0i32; out_len];
         predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
 
@@ -3289,9 +3373,15 @@ fn reconstruct_chroma_intra_444(
 
         // (2) Inverse Hadamard on the per-plane DC.
         let dc_levels = if plane == 0 {
-            mb.residual_cb_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cb_16x16_dc
+                .as_deref()
+                .copied()
+                .unwrap_or([0i32; 16])
         } else {
-            mb.residual_cr_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cr_16x16_dc
+                .as_deref()
+                .copied()
+                .unwrap_or([0i32; 16])
         };
         // DC coefficients are in scan order (§8.5.6 — zig-zag or
         // field). Apply the inverse scan + Hadamard.
@@ -5031,7 +5121,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         pred_cb_slice,
         pred_cr_slice,
         pic,
@@ -5056,7 +5146,7 @@ fn inter_residual_write(
     sps: &Sps,
     pps: &Pps,
     writer: &MbWriter,
-    pred_luma: &[i32; 256],
+    pred_luma: &mut [i32; 256],
     pred_cb: &[i32],
     pred_cr: &[i32],
     pic: &mut Picture,
@@ -5075,20 +5165,30 @@ fn inter_residual_write(
     // §8.5.9 — inter luma lists: 4x4 index iYCbCr + 3, 8x8 index
     // 2 * iYCbCr + 1, with iYCbCr = colour_plane_id when
     // separate_colour_plane_flag == 1 and 0 otherwise.
+    let luma_plane = luma_scaling_plane(sps, slice_header);
+    // (Derived only when a block of the transform size carries
+    // coefficients.)
+    let mut sl4: Option<[i32; 16]> = None;
+    let mut sl8: Option<[i32; 64]> = None;
+    // §8.5.8 / §7.4.2.1.1 eq. 7-40 — qP'Y = QPY + QpBdOffsetY.
     let qp_bd_offset_y = qp_bd_offset(sps.bit_depth_luma_minus8);
     let qp_prime_y = qp_y + qp_bd_offset_y;
+    // §7.4.2.1.1 — lossless bypass: §8.5.12/§8.5.13 are the identity
+    // (eqs. 8-334 / 8-355). No §8.5.15 DPCM for inter macroblocks —
+    // it applies only to Intra_4x4/8x8/16x16 prediction modes.
     let bypass = transform_bypass_active(sps, qp_prime_y);
+    // §8.5.6/§8.5.7 — field inverse scans for FIELD-coded MBs.
     let field_scan = mbaff_field_mb || slice_header.field_pic_flag;
+
+    // The reconstructed macroblock: prediction plus residual, clipped
+    // (eq. 8-x Clip1Y of the §8.5.14 picture construction).
+    let out = pred_luma;
+    // Every §8.5.12 / §8.5.13 transform call validates qP'Y / the bit
+    // depth first, whether or not the block carries coefficients.
     if !bypass {
         crate::transform::check_transform_params(qp_prime_y, bit_depth_y)?;
     }
-    if cbp_luma == 0 {
-        writer.write_luma_mb(pic, pred_luma);
-    } else {
-        let luma_plane = luma_scaling_plane(sps, slice_header);
-        let mut out = *pred_luma;
-        if mb.transform_size_8x8_flag {
-            let sl8 = select_scaling_list_8x8(2 * luma_plane + 1, sps, pps);
+    if mb.transform_size_8x8_flag {
         // §8.5.13 — 8x8 inter residual path (four 8x8 blocks).
         // Each 8x8 is flagged by one bit of cbp_luma. The four 16-
         // entry arrays in residual_luma[blk8*4..blk8*4+4] concatenate
@@ -5102,6 +5202,9 @@ fn inter_residual_write(
                 continue;
             }
             let (bx, by) = LUMA_8X8_XY[blk8];
+            // `residual_luma` is compacted by the parser — quadrants
+            // with cbp_luma bit cleared are skipped, so index by
+            // set-bits-below-blk8 (see Intra_NxN path).
             let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
             let base_slot = set_before * 4;
             let mut scan = [0i32; 64];
@@ -5117,9 +5220,12 @@ fn inter_residual_write(
             }
             let coeffs = inv_scan_8x8(&scan, field_scan);
             let residual = if bypass {
+                // §8.5.13 eq. 8-355 — r = c.
                 coeffs
             } else {
-                inverse_transform_8x8(&coeffs, qp_prime_y, &sl8, bit_depth_y)?
+                let sl8 = sl8
+                    .get_or_insert_with(|| select_scaling_list_8x8(2 * luma_plane + 1, sps, pps));
+                inverse_transform_8x8(&coeffs, qp_prime_y, sl8, bit_depth_y)?
             };
             for y in 0..8 {
                 let o = (by as usize + y) * 16 + bx as usize;
@@ -5128,45 +5234,54 @@ fn inter_residual_write(
                 }
             }
         }
-        } else {
-            let sl4 = select_scaling_list_4x4(luma_plane + 3, sps, pps);
-            #[allow(clippy::needless_range_loop)]
-            for blk4 in 0..16usize {
-                let blk8 = blk4 / 4;
-                if (cbp_luma >> blk8) & 1 == 0 {
-                    continue;
-                }
-                let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
-                let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
-                    continue;
-                };
-                if coeffs_scan.iter().all(|&v| v == 0) {
-                    continue;
-                }
-                let (bx, by) = LUMA_4X4_XY[blk4];
-                let coeffs = inv_scan_4x4(coeffs_scan, field_scan);
-                let residual = if bypass {
-                    coeffs
-                } else {
-                    inverse_transform_4x4(&coeffs, qp_prime_y, &sl4, bit_depth_y)?
-                };
-                if inter_debug {
-                    eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
-                }
-                for y in 0..4 {
-                    let o = (by as usize + y) * 16 + bx as usize;
-                    for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[y * 4..y * 4 + 4]) {
-                        *d += r;
-                    }
+    } else {
+        // §8.5.12 — 4x4 inter residual path.
+        #[allow(clippy::needless_range_loop)] // spec §8.5.12 raster-Z 4x4 walk
+        for blk4 in 0..16usize {
+            let blk8 = blk4 / 4;
+            if (cbp_luma >> blk8) & 1 == 0 {
+                continue;
+            }
+            // Compact index into `residual_luma` — the parser pushes 4
+            // entries per cbp_luma bit that is set in low-bit-first
+            // order, so the array index is (number of set bits below
+            // blk8) * 4 + (blk4 % 4), not blk4.
+            let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
+            let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
+                continue;
+            };
+            if coeffs_scan.iter().all(|&v| v == 0) {
+                continue;
+            }
+            let (bx, by) = LUMA_4X4_XY[blk4];
+            let coeffs = inv_scan_4x4(coeffs_scan, field_scan);
+            let residual = if bypass {
+                // §8.5.12 eq. 8-334 — r = c.
+                coeffs
+            } else {
+                let sl4 =
+                    sl4.get_or_insert_with(|| select_scaling_list_4x4(luma_plane + 3, sps, pps));
+                inverse_transform_4x4(&coeffs, qp_prime_y, sl4, bit_depth_y)?
+            };
+            if inter_debug {
+                eprintln!("    RES blk4={blk4} qp'={qp_prime_y} res={:?}", residual);
+            }
+            for y in 0..4 {
+                let o = (by as usize + y) * 16 + bx as usize;
+                for (d, &r) in out[o..o + 4].iter_mut().zip(&residual[y * 4..y * 4 + 4]) {
+                    *d += r;
                 }
             }
         }
+    }
+    // Clip1Y — an 8-bit plane's store saturates to 0..=255 itself.
+    if bit_depth_y > 8 {
         let max_y = (1i32 << bit_depth_y) - 1;
         for v in out.iter_mut() {
-            *v = (*v).clamp(0, max_y);
+            *v = (*v).max(0).min(max_y);
         }
-        writer.write_luma_mb(pic, &out);
     }
+    writer.write_luma_mb(pic, out);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {
@@ -5562,6 +5677,47 @@ fn derive_and_store_partition<R: RefPicProvider>(
         }
         // §7.4.5 — per 8x8 partition refIdx. Update the 8x8 quadrants
         // this partition covers.
+        let ref_key = |list: u8, ref_idx: i8| -> i32 {
+            let idx = ref_idx.max(0) as u32;
+            match field_parity {
+                Some(par) => {
+                    let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
+                    ref_pics
+                        .ref_pic_poc(list, idx / 2)
+                        .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
+                        .unwrap_or(i32::MIN)
+                }
+                None => {
+                    // Round-416 PAFF — the two parity
+                    // fields of one stored FRAME share the
+                    // frame's POC but are DIFFERENT
+                    // reference pictures for the §8.7.2.1
+                    // NOTE 1 comparison; fold the resolved
+                    // field parity into the identity key
+                    // (frame refs keep the bare poc*4).
+                    let par_term = if slice_header.field_pic_flag {
+                        ref_pics
+                            .ref_field_parity(list, idx)
+                            .map(|p| 1 + p as i32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    ref_pics
+                        .ref_pic_poc(list, idx)
+                        .map(|p| p.wrapping_mul(4).wrapping_add(par_term))
+                        .unwrap_or(i32::MIN)
+                }
+            }
+        };
+        // The identity keys are per partition (not per 8x8 quadrant).
+        let key_l0 = (part.mode != PartMode::L1Only && part.ref_idx_l0 >= 0)
+            .then(|| ref_key(0, part.ref_idx_l0));
+        let key_l1 = (matches!(
+            part.mode,
+            PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+        ) && part.ref_idx_l1 >= 0)
+            .then(|| ref_key(1, part.ref_idx_l1));
         let q_x0 = part.x as usize / 8;
         let q_y0 = part.y as usize / 8;
         let q_nx = (part.w as usize).max(8) / 8;
@@ -5586,43 +5742,10 @@ fn derive_and_store_partition<R: RefPicProvider>(
                     // frame are DIFFERENT reference pictures for bS, as is
                     // the frame vs either of its fields. Encoding:
                     // frame → poc*4, field → poc*4 + 1 + parity.
-                    let ref_key = |list: u8, ref_idx: i8| -> i32 {
-                        let idx = ref_idx.max(0) as u32;
-                        match field_parity {
-                            Some(par) => {
-                                let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
-                                ref_pics
-                                    .ref_pic_poc(list, idx / 2)
-                                    .map(|p| p.wrapping_mul(4).wrapping_add(1 + sel as i32))
-                                    .unwrap_or(i32::MIN)
-                            }
-                            None => {
-                                // Round-416 PAFF — the two parity
-                                // fields of one stored FRAME share the
-                                // frame's POC but are DIFFERENT
-                                // reference pictures for the §8.7.2.1
-                                // NOTE 1 comparison; fold the resolved
-                                // field parity into the identity key
-                                // (frame refs keep the bare poc*4).
-                                let par_term = if slice_header.field_pic_flag {
-                                    ref_pics
-                                        .ref_field_parity(list, idx)
-                                        .map(|p| 1 + p as i32)
-                                        .unwrap_or(0)
-                                } else {
-                                    0
-                                };
-                                ref_pics
-                                    .ref_pic_poc(list, idx)
-                                    .map(|p| p.wrapping_mul(4).wrapping_add(par_term))
-                                    .unwrap_or(i32::MIN)
-                            }
-                        }
-                    };
                     if part.mode != PartMode::L1Only {
                         info.ref_idx_l0[q_idx] = part.ref_idx_l0;
-                        if part.ref_idx_l0 >= 0 {
-                            info.ref_poc_l0[q_idx] = ref_key(0, part.ref_idx_l0);
+                        if let Some(k) = key_l0 {
+                            info.ref_poc_l0[q_idx] = k;
                         }
                     }
                     if matches!(
@@ -5630,8 +5753,8 @@ fn derive_and_store_partition<R: RefPicProvider>(
                         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
                     ) {
                         info.ref_idx_l1[q_idx] = part.ref_idx_l1;
-                        if part.ref_idx_l1 >= 0 {
-                            info.ref_poc_l1[q_idx] = ref_key(1, part.ref_idx_l1);
+                        if let Some(k) = key_l1 {
+                            info.ref_poc_l1[q_idx] = k;
                         }
                     }
                 }
@@ -5672,6 +5795,31 @@ enum CombineOp {
 }
 
 impl CombineOp {
+    /// The same combine without the multiplications when the weights
+    /// are the identity: eqs. 8-274 / 8-275 with w = 2^logWD and o = 0
+    /// give the sample itself (a copy, §8.4.2.3.1), eq. 8-276 with
+    /// w0 = w1 = 2^logWD and o0 = o1 = 0 gives eq. 8-273's average.
+    fn simplified(self) -> Self {
+        match self {
+            CombineOp::Weighted {
+                mode,
+                w0,
+                w1,
+                log2_wd,
+            } => {
+                let unit = 1i32 << log2_wd;
+                let identity = |e: WeightedEntry| e.weight == unit && e.offset == 0;
+                match mode {
+                    BiPredMode::L0Only if identity(w0) => CombineOp::Copy0,
+                    BiPredMode::L1Only if identity(w1) => CombineOp::Copy1,
+                    BiPredMode::Bipred if identity(w0) && identity(w1) => CombineOp::Avg,
+                    _ => self,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// §8.4.2.3.1 — the default combine for the lists in use.
     fn default_for(mode: Option<BiPredMode>) -> Self {
         match mode {
@@ -5699,6 +5847,7 @@ fn combine_partition(
     op: CombineOp,
     bit_depth: u32,
 ) {
+    let op = op.simplified();
     match op {
         CombineOp::Zero => {
             for y in 0..h {
@@ -5799,11 +5948,13 @@ fn combine_partition(
                         // Eq. 8-274 / 8-275, logWD >= 1.
                         let round = 1i32 << (log2_wd - 1);
                         for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
+                            *d = (((p * e.weight + round) >> log2_wd) + e.offset)
+                                .max(0)
+                                .min(max_v);
                         }
                     } else {
                         for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (p * e.weight + e.offset).clamp(0, max_v);
+                            *d = (p * e.weight + e.offset).max(0).min(max_v);
                         }
                     }
                 }
@@ -5813,7 +5964,7 @@ fn combine_partition(
                     let off = (w0.offset + w1.offset + 1) >> 1;
                     for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
                         let sum = p0 * w0.weight + p1 * w1.weight + round;
-                        *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
+                        *d = ((sum >> (log2_wd + 1)) + off).max(0).min(max_v);
                     }
                 }
             }
@@ -5972,6 +6123,40 @@ fn predict_partition_with<R: RefPicProvider>(
         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
     ) && part.ref_idx_l1 >= 0;
 
+    // §8.4.2.3 — a single-list partition whose combine is the plain
+    // copy (default prediction, or explicit identity weights) is
+    // motion-compensated straight into the macroblock's prediction.
+    let use_explicit = weighted_explicit_active(slice_header, pps);
+    let luma_copy_list: Option<u8> = {
+        let list = match (has_l0, has_l1) {
+            (true, false) => Some(0u8),
+            (false, true) => Some(1u8),
+            _ => None,
+        };
+        list.filter(|&l| {
+            !use_explicit
+                || slice_header.pred_weight_table.as_ref().is_some_and(|pwt| {
+                    let lwd = pwt.luma_log2_weight_denom;
+                    let r = if l == 0 {
+                        part.ref_idx_l0
+                    } else {
+                        part.ref_idx_l1
+                    };
+                    let r = if field_parity.is_some() && r >= 0 {
+                        r / 2
+                    } else {
+                        r
+                    };
+                    luma_weight_entry(pwt, l, r, lwd)
+                        == WeightedEntry {
+                            weight: 1 << lwd,
+                            offset: 0,
+                        }
+                })
+        })
+    };
+    let pred_off = part.y as usize * 16 + part.x as usize;
+
     if has_l0 {
         let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
         if inter_debug {
@@ -5982,7 +6167,9 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma.len().min(64))
+                    .map(|i| rp.luma.get(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -5993,7 +6180,16 @@ fn predict_partition_with<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            l0_buf,
+            if luma_copy_list == Some(0) {
+                &mut pred_luma[pred_off..]
+            } else {
+                &mut l0_buf[..]
+            },
+            if luma_copy_list == Some(0) {
+                16
+            } else {
+                w as usize
+            },
             fld,
             ref_planes_for(0, part.ref_idx_l0),
         )?;
@@ -6008,7 +6204,9 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                (0..rp.luma.len().min(64))
+                    .map(|i| rp.luma.get(i) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -6019,7 +6217,16 @@ fn predict_partition_with<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            l1_buf,
+            if luma_copy_list == Some(1) {
+                &mut pred_luma[pred_off..]
+            } else {
+                &mut l1_buf[..]
+            },
+            if luma_copy_list == Some(1) {
+                16
+            } else {
+                w as usize
+            },
             fld,
             ref_planes_for(1, part.ref_idx_l1),
         )?;
@@ -6051,7 +6258,6 @@ fn predict_partition_with<R: RefPicProvider>(
     //     derived from POC distance; only the bipred sub-case uses
     //     implicit weighting (single-list partitions fall through to
     //     the default copy-through).
-    let use_explicit = weighted_explicit_active(slice_header, pps);
     let bi_mode = if has_l0 && has_l1 {
         Some(BiPredMode::Bipred)
     } else if has_l0 {
@@ -6167,17 +6373,19 @@ fn predict_partition_with<R: RefPicProvider>(
     } else {
         CombineOp::default_for(bi_mode)
     };
-    combine_partition(
-        pred_luma,
-        part.y as usize * 16 + part.x as usize,
-        16,
-        l0_buf,
-        l1_buf,
-        w as usize,
-        h as usize,
-        luma_op,
-        bit_depth_y,
-    );
+    if luma_copy_list.is_none() {
+        combine_partition(
+            pred_luma,
+            pred_off,
+            16,
+            l0_buf,
+            l1_buf,
+            w as usize,
+            h as usize,
+            luma_op,
+            bit_depth_y,
+        );
+    }
 
     // Chroma MC. For 4:2:0, chroma MV = mv_luma / 2 in 1/4-pel units
     // at luma resolution -> 1/8-pel chroma units. §8.4.1.4 / §8.4.2.2.
@@ -6247,40 +6455,6 @@ fn predict_partition_with<R: RefPicProvider>(
             }
             mv
         };
-        if has_l0 {
-            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l0_cb,
-                l0_cr,
-                fld,
-                ref_planes_for(0, part.ref_idx_l0),
-            )?;
-        }
-        if has_l1 {
-            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l1_cb,
-                l1_cr,
-                fld,
-                ref_planes_for(1, part.ref_idx_l1),
-            )?;
-        }
         // Combine into pred_cb / pred_cr at MB-local position.
         // §8.4.2.3 — the same default/explicit/implicit dispatch as
         // luma applies to chroma. Explicit mode uses separate weights
@@ -6329,28 +6503,97 @@ fn predict_partition_with<R: RefPicProvider>(
             (default_op, default_op)
         };
         let c_off = c_part_y as usize * mbw_c_use as usize + c_part_x as usize;
-        combine_partition(
-            pred_cb,
-            c_off,
-            mbw_c_use as usize,
-            l0_cb,
-            l1_cb,
-            c_w as usize,
-            c_h as usize,
-            cb_op,
-            bit_depth_c,
-        );
-        combine_partition(
-            pred_cr,
-            c_off,
-            mbw_c_use as usize,
-            l0_cr,
-            l1_cr,
-            c_w as usize,
-            c_h as usize,
-            cr_op,
-            bit_depth_c,
-        );
+        // Single-list copy into both planes: motion-compensated straight
+        // into the macroblock's prediction (as for luma).
+        let chroma_copy_list = match (cb_op.simplified(), cr_op.simplified()) {
+            (CombineOp::Copy0, CombineOp::Copy0) => Some(0u8),
+            (CombineOp::Copy1, CombineOp::Copy1) => Some(1u8),
+            _ => None,
+        };
+        if has_l0 {
+            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                if chroma_copy_list == Some(0) {
+                    &mut pred_cb[c_off..]
+                } else {
+                    &mut l0_cb[..]
+                },
+                if chroma_copy_list == Some(0) {
+                    &mut pred_cr[c_off..]
+                } else {
+                    &mut l0_cr[..]
+                },
+                if chroma_copy_list == Some(0) {
+                    mbw_c_use as usize
+                } else {
+                    c_w as usize
+                },
+                fld,
+                ref_planes_for(0, part.ref_idx_l0),
+            )?;
+        }
+        if has_l1 {
+            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                if chroma_copy_list == Some(1) {
+                    &mut pred_cb[c_off..]
+                } else {
+                    &mut l1_cb[..]
+                },
+                if chroma_copy_list == Some(1) {
+                    &mut pred_cr[c_off..]
+                } else {
+                    &mut l1_cr[..]
+                },
+                if chroma_copy_list == Some(1) {
+                    mbw_c_use as usize
+                } else {
+                    c_w as usize
+                },
+                fld,
+                ref_planes_for(1, part.ref_idx_l1),
+            )?;
+        }
+        if chroma_copy_list.is_none() {
+            combine_partition(
+                pred_cb,
+                c_off,
+                mbw_c_use as usize,
+                l0_cb,
+                l1_cb,
+                c_w as usize,
+                c_h as usize,
+                cb_op,
+                bit_depth_c,
+            );
+            combine_partition(
+                pred_cr,
+                c_off,
+                mbw_c_use as usize,
+                l0_cr,
+                l1_cr,
+                c_w as usize,
+                c_h as usize,
+                cr_op,
+                bit_depth_c,
+            );
+        }
     } else if chroma_array_type == 3 {
         // §8.4.2.2 (ChromaArrayType == 3) — 4:4:4 chroma is
         // motion-compensated identically to luma: full-resolution
@@ -6602,6 +6845,7 @@ fn mc_luma_partition(
     h: u32,
     bit_depth: u32,
     dst: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6629,14 +6873,14 @@ fn mc_luma_partition(
     // §8.4.2.1 — field view of a stored frame: rows of one parity,
     // exposed zero-copy as a doubled-stride half-height plane.
     let stride = ref_pic.width_in_samples as usize;
-    let (src, src_stride, src_h): (&[i32], usize, usize) = match field {
+    let (src, src_stride, src_h): (SamplesRef<'_>, usize, usize) = match field {
         Some(parity) => (
-            &ref_pic.luma[(parity as usize) * stride..],
+            ref_pic.luma.as_ref().slice_from((parity as usize) * stride),
             stride * 2,
             (ref_pic.height_in_samples as usize) / 2,
         ),
         None => (
-            &ref_pic.luma[..],
+            ref_pic.luma.as_ref(),
             stride,
             ref_pic.height_in_samples as usize,
         ),
@@ -6670,7 +6914,7 @@ fn mc_luma_partition(
         h as usize,
         (1i32 << bit_depth) - 1,
         dst,
-        w as usize,
+        dst_stride,
     );
     Ok(())
 }
@@ -6691,6 +6935,7 @@ fn mc_chroma_partition(
     bit_depth: u32,
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6753,14 +6998,14 @@ fn mc_chroma_partition(
         let src = match planes {
             Some(p) => p.chroma_src(i as u8),
             None => crate::mc::PlaneSrc::Flat {
-                data: &plane[row_off..],
+                data: plane.as_ref().slice_from(row_off),
                 stride: src_stride,
                 width: cw,
                 height: src_h,
             },
         };
         crate::mc::chroma(
-            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, w as usize,
+            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, dst_stride,
         );
     }
     Ok(())
@@ -6823,38 +7068,29 @@ fn mc_chroma_partition_444(
 
     // §8.4.2.2.1 — luma interpolation process applied to each chroma
     // plane (the same 6-tap kernel `mc_luma_partition` drives).
-    interpolate_luma(
-        &ref_pic.cb[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cb,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_luma(
-        &ref_pic.cr[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cr,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    if w == 0 || h == 0 || w > 16 || h > 16 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
+        return Err(ReconstructError::IntraPredOutOfBounds);
+    }
+    for (plane, dst) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)] {
+        let src = crate::mc::PlaneSrc::Flat {
+            data: plane.as_ref().slice_from(row_off),
+            stride: src_stride,
+            width: cw,
+            height: src_h,
+        };
+        crate::mc::luma(
+            &src,
+            int_x,
+            int_y,
+            x_frac,
+            y_frac,
+            w as usize,
+            h as usize,
+            (1i32 << bit_depth) - 1,
+            dst,
+            w as usize,
+        );
+    }
     Ok(())
 }
 
@@ -8314,52 +8550,10 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     let (a_l1, b_l1, c_l1, d_l1) =
         neighbour_mvs_for_list(&neighbour_probe, mb_addr, grid, 1, current_slice_id);
 
-    // §8.4.1.2.2 step 4 — MinPositive chain to pick refIdxLX. This
-    // mirrors the pre-step-5 derivation inside
-    // `derive_b_spatial_direct_with_d`; we redo it here so we can
-    // observe whether BOTH refs were < 0 (i.e. directZeroPredictionFlag
-    // should fire) before the helper's step-5 fallback collapses them
-    // to 0.
-    fn min_positive(x: i32, y: i32) -> i32 {
-        if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
-    }
-    // §8.4.1.3.2 eq. 8-214..8-216 — C→D substitution when C is
-    // unavailable (partition_available == false).
-    let c_l0_eff = if !c_l0.partition_available && d_l0.partition_available {
-        d_l0
-    } else {
-        c_l0
-    };
-    let c_l1_eff = if !c_l1.partition_available && d_l1.partition_available {
-        d_l1
-    } else {
-        c_l1
-    };
-
-    let ref_l0_minp = min_positive(a_l0.ref_idx, min_positive(b_l0.ref_idx, c_l0_eff.ref_idx));
-    let ref_l1_minp = min_positive(a_l1.ref_idx, min_positive(b_l1.ref_idx, c_l1_eff.ref_idx));
-
-    // §8.4.1.2.2 step 5 — directZeroPredictionFlag = both refs < 0.
-    let direct_zero_both = ref_l0_minp < 0 && ref_l1_minp < 0;
-    let ref_idx_l0_final: i8 = if direct_zero_both {
-        0
-    } else if ref_l0_minp < 0 {
-        -1
-    } else {
-        ref_l0_minp as i8
-    };
-    let ref_idx_l1_final: i8 = if direct_zero_both {
-        0
-    } else if ref_l1_minp < 0 {
-        -1
-    } else {
-        ref_l1_minp as i8
-    };
-
-    // Keep the MB-level MVs from the helper for debug / symmetry —
-    // not used directly (we recompute per sub-block via
-    // `derive_median_mvpred` below).
-    let _ = derive_b_spatial_direct_with_d(a_l0, a_l1, b_l0, b_l1, c_l0, c_l1, d_l0, d_l1);
+    let c_l0_eff = c_or_d(c_l0, d_l0);
+    let c_l1_eff = c_or_d(c_l1, d_l1);
+    let (ref_idx_l0_final, ref_idx_l1_final, direct_zero_both) =
+        spatial_direct_ref_idx([a_l0, b_l0, c_l0, d_l0], [a_l1, b_l1, c_l1, d_l1]);
 
     // §8.4.1.2.2 step 7 — colZeroFlag requires RefPicList1[0] to be a
     // short-term reference and the colocated block to have a small
@@ -8380,6 +8574,10 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
     let block_size = step as u8;
     let n_per_row = (region_size as usize) / step;
 
+    // §8.4.1.2.2 NOTE 3 — the mvLX §8.4.1.3 gives is the same for every
+    // sub-partition: derived once.
+    let mut median_l0: Option<Mv> = None;
+    let mut median_l1: Option<Mv> = None;
     let mut partitions = Vec::with_capacity(n_per_row * n_per_row);
     for by in 0..n_per_row {
         for bx in 0..n_per_row {
@@ -8430,7 +8628,9 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
             {
                 Mv::ZERO
             } else {
-                derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
+                *median_l0.get_or_insert_with(|| {
+                    derive_median_mvpred(a_l0, b_l0, c_l0_eff, ref_idx_l0_final as i32)
+                })
             };
             let mv_l1 = if direct_zero_both
                 || ref_idx_l1_final < 0
@@ -8438,7 +8638,9 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
             {
                 Mv::ZERO
             } else {
-                derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
+                *median_l1.get_or_insert_with(|| {
+                    derive_median_mvpred(a_l1, b_l1, c_l1_eff, ref_idx_l1_final as i32)
+                })
             };
 
             // Build the partition mode: if only L0 is valid we should
@@ -8467,6 +8669,37 @@ fn build_spatial_direct_partitions<R: RefPicProvider>(
         }
     }
     partitions
+}
+
+/// §8.4.1.3.2 eqs. 8-214..8-216 — C replaced by D when partition C
+/// is not available.
+#[inline]
+fn c_or_d(c: NeighbourMv, d: NeighbourMv) -> NeighbourMv {
+    if !c.partition_available && d.partition_available {
+        d
+    } else {
+        c
+    }
+}
+
+/// §8.4.1.2.2 steps 4 / 5 — refIdxL0 / refIdxL1 of spatial direct
+/// prediction from the macroblock's neighbours `[A, B, C, D]` per list
+/// (eq. 8-184 MinPositive chain), and directZeroPredictionFlag (both
+/// negative: both set to 0).
+fn spatial_direct_ref_idx(l0: [NeighbourMv; 4], l1: [NeighbourMv; 4]) -> (i8, i8, bool) {
+    fn min_positive(x: i32, y: i32) -> i32 {
+        if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) }
+    }
+    let pick = |n: [NeighbourMv; 4]| {
+        let c = c_or_d(n[2], n[3]);
+        min_positive(n[0].ref_idx, min_positive(n[1].ref_idx, c.ref_idx))
+    };
+    let (r0, r1) = (pick(l0), pick(l1));
+    if r0 < 0 && r1 < 0 {
+        return (0, 0, true);
+    }
+    let fin = |r: i32| if r < 0 { -1 } else { r as i8 };
+    (fin(r0), fin(r1), false)
 }
 
 /// Table 7-14 — B_L0/B_L1/B_Bi 16x16 → (mode, ref_idx_l0, ref_idx_l1).
@@ -8724,13 +8957,22 @@ fn reconstruct_inter_chroma_residual(
     }
 
     // §7.4.2.1.1.1 Table 7-2 — inter chroma lists: i=4 (Cb) / i=5 (Cr).
-    let sl4_cb = select_scaling_list_4x4(4, sps, pps);
-    let sl4_cr = select_scaling_list_4x4(5, sps, pps);
+    // (A macroblock without chroma coefficients needs neither list.)
+    let lists = (cbp_chroma > 0).then(|| {
+        [
+            select_scaling_list_4x4(4, sps, pps),
+            select_scaling_list_4x4(5, sps, pps),
+        ]
+    });
+    let (sl4_cb, sl4_cr) = match &lists {
+        Some([cb, cr]) => (cb, cr),
+        None => (&FLAT_4X4_16, &FLAT_4X4_16),
+    };
     let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
     let n_ac = 4 * num_c8x8 as usize;
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
-        let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
+        let sl4 = if plane == 0 { sl4_cb } else { sl4_cr };
         let dc_block = if plane == 0 {
             &mb.residual_chroma_dc_cb
         } else {
@@ -8823,9 +9065,12 @@ fn reconstruct_inter_chroma_residual(
                 }
             }
         }
-        let max_c = (1i32 << bit_depth_c) - 1;
-        for v in out.iter_mut() {
-            *v = (*v).clamp(0, max_c);
+        // Clip1C — an 8-bit plane's store saturates to 0..=255 itself.
+        if bit_depth_c > 8 {
+            let max_c = (1i32 << bit_depth_c) - 1;
+            for v in out.iter_mut() {
+                *v = (*v).max(0).min(max_c);
+            }
         }
         writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize);
     }
@@ -9168,6 +9413,20 @@ fn deblock_picture(
     // top edge of a frame MB below a field pair is filtered TWICE in
     // field mode ((xE, yE) = (k, 0) and (k, 1)). Non-MBAFF pictures
     // keep the geometric picture-grid walker below.
+    if mbaff_frame_flag && threads > 1 && pic.chroma_array_type != 3 && grid.height_in_mbs > 2 {
+        deblock_mbaff_rows_threaded(
+            pic,
+            grid,
+            alpha_off,
+            beta_off,
+            bit_depth_y,
+            bit_depth_c,
+            pps,
+            mb_field_flags,
+            threads,
+        );
+        return;
+    }
     if mbaff_frame_flag {
         deblock_mbaff_frame(
             pic,
@@ -9481,6 +9740,68 @@ fn in_mb_chroma_coords(
         (cx - xo_c).clamp(0, max_x) as u32,
         ((cy - yo_c) / dy).clamp(0, max_y) as u32,
     )
+}
+
+/// §8.7.2.1 — bS is a property of the two 4x4 luma blocks holding p0
+/// and q0 (their macroblocks, coding modes, coefficients, references
+/// and motion vectors), not of the individual sample line: the MBAFF
+/// walker asks for it once per line, so remember recent answers keyed
+/// by (p MB, q MB, p block, q block, edge direction). Chroma lines map
+/// onto the same luma blocks, and both chroma planes ask again.
+struct MbaffBsMemo {
+    slots: [Option<(MbaffBsKey, MbaffBs)>; 32],
+}
+
+/// (p MB, q MB, p block x / y, q block x / y, vertical edge).
+type MbaffBsKey = (u32, u32, u8, u8, u8, u8, bool);
+/// bS with the p and q macroblocks' QPY; `None` when either macroblock
+/// is unavailable.
+type MbaffBs = Option<(u8, i32, i32)>;
+
+impl MbaffBsMemo {
+    fn new() -> Self {
+        Self { slots: [None; 32] }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn get(
+        &mut self,
+        grid: &MbGrid,
+        p_addr: u32,
+        q_addr: u32,
+        p_in: (u32, u32),
+        q_in: (u32, u32),
+        vertical_edge: bool,
+        mb_field_flags: &[bool],
+    ) -> Option<(u8, i32, i32)> {
+        let key: MbaffBsKey = (
+            p_addr,
+            q_addr,
+            (p_in.0 >> 2) as u8,
+            (p_in.1 >> 2) as u8,
+            (q_in.0 >> 2) as u8,
+            (q_in.1 >> 2) as u8,
+            vertical_edge,
+        );
+        let slot =
+            (key.4 as usize | ((key.5 as usize) << 2) | (usize::from(vertical_edge) << 4)) & 31;
+        if let Some((k, v)) = self.slots[slot]
+            && k == key
+        {
+            return v;
+        }
+        let v = mbaff_edge_bs(
+            grid,
+            p_addr,
+            q_addr,
+            p_in,
+            q_in,
+            vertical_edge,
+            mb_field_flags,
+        );
+        self.slots[slot] = Some((key, v));
+        v
+    }
 }
 
 /// §8.7.2.1 — derive bS + the two macroblocks' QPY for one MBAFF
@@ -9804,130 +10125,204 @@ fn deblock_mbaff_frame(
     pps: &Pps,
     mb_field_flags: &[bool],
 ) {
+    let prm = MbaffDeblockParams::new(
+        alpha_off,
+        beta_off,
+        bit_depth_y,
+        bit_depth_c,
+        pps,
+        mb_field_flags,
+    );
+    let mut bs_memo = MbaffBsMemo::new();
+    for addr in 0..grid.width_in_mbs * grid.height_in_mbs {
+        deblock_mbaff_mb(pic, 0, 0, grid, addr, &prm, &mut bs_memo);
+    }
+}
+
+impl<'a> MbaffDeblockParams<'a> {
+    fn new(
+        alpha_off: i32,
+        beta_off: i32,
+        bit_depth_y: u32,
+        bit_depth_c: u32,
+        pps: &Pps,
+        mb_field_flags: &'a [bool],
+    ) -> Self {
+        Self {
+            alpha_off,
+            beta_off,
+            bit_depth_y,
+            bit_depth_c,
+            cb_offset: pps.chroma_qp_index_offset,
+            cr_offset: pps
+                .extension
+                .as_ref()
+                .map(|e| e.second_chroma_qp_index_offset)
+                .unwrap_or(pps.chroma_qp_index_offset),
+            qp_bd_offset_c: qp_bd_offset(bit_depth_c.saturating_sub(8)),
+            mb_field_flags,
+        }
+    }
+}
+
+/// §8.7 — the per-picture constants of the MBAFF deblocking walker.
+struct MbaffDeblockParams<'a> {
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    cb_offset: i32,
+    cr_offset: i32,
+    qp_bd_offset_c: i32,
+    mb_field_flags: &'a [bool],
+}
+
+/// §8.7 steps 1-3 for macroblock `addr` of an MBAFF frame: its luma
+/// then chroma vertical and horizontal edges, with the eq. 8-442..8-449
+/// sample geometry. `pic` holds the picture's samples from luma row
+/// `y_off` / chroma row `yc_off` on (the whole picture, or a band of
+/// it for the row-parallel walker); every row the edges touch must be
+/// inside it.
+fn deblock_mbaff_mb(
+    pic: &mut Picture,
+    y_off: i32,
+    yc_off: i32,
+    grid: &MbGrid,
+    addr: u32,
+    prm: &MbaffDeblockParams<'_>,
+    bs_memo: &mut MbaffBsMemo,
+) {
+    let MbaffDeblockParams {
+        alpha_off,
+        beta_off,
+        bit_depth_y,
+        bit_depth_c,
+        cb_offset,
+        cr_offset,
+        qp_bd_offset_c,
+        mb_field_flags,
+    } = *prm;
     let mb_w = grid.width_in_mbs;
-    let pic_size = grid.width_in_mbs * grid.height_in_mbs;
     let chroma = matches!(pic.chroma_array_type, 1 | 2);
     let (sub_w, sub_h) = chroma_subsample(pic.chroma_array_type);
-    let cb_offset = pps.chroma_qp_index_offset;
-    let cr_offset = pps
-        .extension
-        .as_ref()
-        .map(|e| e.second_chroma_qp_index_offset)
-        .unwrap_or(pps.chroma_qp_index_offset);
-    let qp_bd_offset_c = qp_bd_offset(bit_depth_c.saturating_sub(8));
+    let Some(info) = grid.get(addr) else { return };
+    if !info.available {
+        return;
+    }
+    let field = mb_field_flags.get(addr as usize).copied().unwrap_or(false);
+    let dy = if field { 2 } else { 1 };
+    let (x_i, y_i) = mb_sample_origin(grid, addr, true, field);
+    let pair_idx = addr >> 1;
+    let pair_col0 = pair_idx.is_multiple_of(mb_w);
+    let pair_row0 = pair_idx < mb_w;
+    let is_top = addr.is_multiple_of(2);
+    let t8 = info.transform_size_8x8_flag;
 
-    for addr in 0..pic_size {
-        let Some(info) = grid.get(addr) else { continue };
-        if !info.available {
+    // §8.7 step 2c/2d — filterLeftMbEdgeFlag / filterTopMbEdgeFlag
+    // (disable_deblocking_filter_idc handling matches the
+    // geometric walker: filtering always enabled).
+    let filter_left = !pair_col0;
+    let filter_top = if pair_row0 { !field && !is_top } else { true };
+    // §8.7 step 3c first bullet — frame TOP MB whose above pair's
+    // bottom MB is FIELD-coded: the top edge is filtered twice in
+    // field mode ((k, 0) then (k, 1)).
+    let special_top = filter_top
+        && is_top
+        && !field
+        && !pair_row0
+        && mb_field_flags
+            .get((addr - 2 * mb_w + 1) as usize)
+            .copied()
+            .unwrap_or(false);
+    // The left MB edge pairs each line with the same line of the
+    // same-position MB of the left pair when both pairs share the
+    // frame / field coding; otherwise (§6.4.12.2 Table 6-4) the
+    // p MB and row change from line to line.
+    let left_regular = filter_left
+        && mb_field_flags
+            .get((2 * (pair_idx - 1)) as usize)
+            .copied()
+            .unwrap_or(false)
+            == field;
+
+    // bS is constant over the lines whose p0 / q0 fall in the same
+    // pair of 4x4 luma blocks (§8.7.2.1): derive it at the first
+    // line of each such group, per line where the left neighbour
+    // mapping is irregular.
+
+    // ---- luma vertical edges (left → right) ----
+    for xe in [0i32, 4, 8, 12] {
+        if xe == 0 && !filter_left {
             continue;
         }
-        let field = mb_field_flags.get(addr as usize).copied().unwrap_or(false);
-        let dy = if field { 2 } else { 1 };
-        let (x_i, y_i) = mb_sample_origin(grid, addr, true, field);
-        let pair_idx = addr >> 1;
-        let pair_col0 = pair_idx % mb_w == 0;
-        let pair_row0 = pair_idx < mb_w;
-        let is_top = addr % 2 == 0;
-        let t8 = info.transform_size_8x8_flag;
-
-        // §8.7 step 2c/2d — filterLeftMbEdgeFlag / filterTopMbEdgeFlag
-        // (disable_deblocking_filter_idc handling matches the
-        // geometric walker: filtering always enabled).
-        let filter_left = !pair_col0;
-        let filter_top = if pair_row0 { !field && !is_top } else { true };
-        // §8.7 step 3c first bullet — frame TOP MB whose above pair's
-        // bottom MB is FIELD-coded: the top edge is filtered twice in
-        // field mode ((k, 0) then (k, 1)).
-        let special_top = filter_top
-            && is_top
-            && !field
-            && !pair_row0
-            && mb_field_flags
-                .get((addr - 2 * mb_w + 1) as usize)
-                .copied()
-                .unwrap_or(false);
-
-        // ---- luma vertical edges (left → right) ----
-        for xe in [0i32, 4, 8, 12] {
-            if xe == 0 && !filter_left {
-                continue;
-            }
-            if (xe == 4 || xe == 12) && t8 {
-                continue;
-            }
-            let qx = x_i + xe;
-            for k in 0..16i32 {
-                let y = y_i + dy * k;
-                let (p_addr, p_in) = if xe == 0 {
-                    let Some(pa) = pixel_to_mb_addr(grid, qx - 1, y, true, mb_field_flags) else {
-                        continue;
-                    };
-                    (pa, in_mb_luma_coords(grid, pa, mb_field_flags, qx - 1, y))
-                } else {
-                    (addr, ((xe - 1) as u32, k as u32))
-                };
-                let q_in = (xe as u32, k as u32);
-                let Some((bs, p_qp, q_qp)) =
-                    mbaff_edge_bs(grid, p_addr, addr, p_in, q_in, true, mb_field_flags)
-                else {
-                    continue;
-                };
-                if bs == 0 {
-                    continue;
-                }
-                filter_luma_set_row(pic, qx, y, bs, p_qp, q_qp, alpha_off, beta_off, bit_depth_y);
-            }
+        if (xe == 4 || xe == 12) && t8 {
+            continue;
         }
-
-        // ---- luma horizontal edges (top → bottom) ----
-        if filter_top {
-            if special_top {
-                for ye in [0i32, 1] {
-                    // Eq. 8-444: base q0 row = yP + 2*yE − (yE % 2);
-                    // tap stride 2 (field mode).
-                    let base_q = y_i + 2 * ye - (ye % 2);
-                    for k in 0..16i32 {
-                        let x = x_i + k;
-                        let py0 = base_q - 2;
-                        let Some(pa) = pixel_to_mb_addr(grid, x, py0, true, mb_field_flags) else {
-                            continue;
-                        };
-                        let p_in = in_mb_luma_coords(grid, pa, mb_field_flags, x, py0);
-                        let q_in = (k as u32, (base_q - y_i).clamp(0, 15) as u32);
-                        let Some((bs, p_qp, q_qp)) =
-                            mbaff_edge_bs(grid, pa, addr, p_in, q_in, false, mb_field_flags)
+        let qx = x_i + xe;
+        let per_line = xe == 0 && !left_regular;
+        let mut cur = None;
+        for k in 0..16i32 {
+            let y = y_i + dy * k;
+            if per_line || k % 4 == 0 {
+                cur = 'bs: {
+                    let (p_addr, p_in) = if xe == 0 {
+                        let Some(pa) = pixel_to_mb_addr(grid, qx - 1, y, true, mb_field_flags)
                         else {
-                            continue;
+                            break 'bs None;
                         };
-                        if bs == 0 {
-                            continue;
-                        }
-                        filter_luma_set_col(
-                            pic,
-                            x,
-                            base_q,
-                            2,
-                            bs,
-                            p_qp,
-                            q_qp,
-                            alpha_off,
-                            beta_off,
-                            bit_depth_y,
-                        );
-                    }
-                }
-            } else {
+                        (pa, in_mb_luma_coords(grid, pa, mb_field_flags, qx - 1, y))
+                    } else {
+                        (addr, ((xe - 1) as u32, k as u32))
+                    };
+                    let q_in = (xe as u32, k as u32);
+                    bs_memo.get(grid, p_addr, addr, p_in, q_in, true, mb_field_flags)
+                };
+            }
+            let Some((bs, p_qp, q_qp)) = cur else {
+                continue;
+            };
+            if bs == 0 {
+                continue;
+            }
+            filter_luma_set_row(
+                pic,
+                qx,
+                y - y_off,
+                bs,
+                p_qp,
+                q_qp,
+                alpha_off,
+                beta_off,
+                bit_depth_y,
+            );
+        }
+    }
+
+    // ---- luma horizontal edges (top → bottom) ----
+    // The p MB of a horizontal edge does not change along it, so
+    // every group of four columns shares one bS.
+    if filter_top {
+        if special_top {
+            for ye in [0i32, 1] {
+                // Eq. 8-444: base q0 row = yP + 2*yE − (yE % 2);
+                // tap stride 2 (field mode).
+                let base_q = y_i + 2 * ye - (ye % 2);
+                let mut cur = None;
                 for k in 0..16i32 {
                     let x = x_i + k;
-                    let py0 = y_i - dy;
-                    let Some(pa) = pixel_to_mb_addr(grid, x, py0, true, mb_field_flags) else {
-                        continue;
-                    };
-                    let p_in = in_mb_luma_coords(grid, pa, mb_field_flags, x, py0);
-                    let q_in = (k as u32, 0u32);
-                    let Some((bs, p_qp, q_qp)) =
-                        mbaff_edge_bs(grid, pa, addr, p_in, q_in, false, mb_field_flags)
-                    else {
+                    if k % 4 == 0 {
+                        cur = 'bs: {
+                            let py0 = base_q - 2;
+                            let Some(pa) = pixel_to_mb_addr(grid, x, py0, true, mb_field_flags)
+                            else {
+                                break 'bs None;
+                            };
+                            let p_in = in_mb_luma_coords(grid, pa, mb_field_flags, x, py0);
+                            let q_in = (k as u32, (base_q - y_i).clamp(0, 15) as u32);
+                            bs_memo.get(grid, pa, addr, p_in, q_in, false, mb_field_flags)
+                        };
+                    }
+                    let Some((bs, p_qp, q_qp)) = cur else {
                         continue;
                     };
                     if bs == 0 {
@@ -9936,8 +10331,8 @@ fn deblock_mbaff_frame(
                     filter_luma_set_col(
                         pic,
                         x,
-                        y_i,
-                        dy,
+                        base_q - y_off,
+                        2,
                         bs,
                         p_qp,
                         q_qp,
@@ -9947,19 +10342,22 @@ fn deblock_mbaff_frame(
                     );
                 }
             }
-        }
-        for ye in [4i32, 8, 12] {
-            if (ye == 4 || ye == 12) && t8 {
-                continue;
-            }
-            let base_q = y_i + dy * ye;
+        } else {
+            let mut cur = None;
             for k in 0..16i32 {
                 let x = x_i + k;
-                let p_in = (k as u32, (ye - 1) as u32);
-                let q_in = (k as u32, ye as u32);
-                let Some((bs, p_qp, q_qp)) =
-                    mbaff_edge_bs(grid, addr, addr, p_in, q_in, false, mb_field_flags)
-                else {
+                if k % 4 == 0 {
+                    cur = 'bs: {
+                        let py0 = y_i - dy;
+                        let Some(pa) = pixel_to_mb_addr(grid, x, py0, true, mb_field_flags) else {
+                            break 'bs None;
+                        };
+                        let p_in = in_mb_luma_coords(grid, pa, mb_field_flags, x, py0);
+                        let q_in = (k as u32, 0u32);
+                        bs_memo.get(grid, pa, addr, p_in, q_in, false, mb_field_flags)
+                    };
+                }
+                let Some((bs, p_qp, q_qp)) = cur else {
                     continue;
                 };
                 if bs == 0 {
@@ -9968,7 +10366,7 @@ fn deblock_mbaff_frame(
                 filter_luma_set_col(
                     pic,
                     x,
-                    base_q,
+                    y_i - y_off,
                     dy,
                     bs,
                     p_qp,
@@ -9979,141 +10377,176 @@ fn deblock_mbaff_frame(
                 );
             }
         }
-
-        // ---- chroma edges (4:2:0 / 4:2:2) ----
-        if !chroma {
+    }
+    for ye in [4i32, 8, 12] {
+        if (ye == 4 || ye == 12) && t8 {
             continue;
         }
-        let mbw_c = 16 / sub_w;
-        let mbh_c = 16 / sub_h;
-        let x_c = x_i / sub_w;
-        // §8.7.1 — yP for chroma: (yI + SubHeightC − 1) / SubHeightC.
-        let y_c = (y_i + sub_h - 1) / sub_h;
-        for plane in 0..2u8 {
-            let qp_off = if plane == 0 { cb_offset } else { cr_offset };
-            let cqp = |p_qp: i32, q_qp: i32| chroma_qp_avg(p_qp, q_qp, qp_off, qp_bd_offset_c);
-
-            // Vertical chroma edges at xE ∈ {0, 4} (chroma MB is 8 wide).
-            for xe in [0i32, 4] {
-                if xe == 0 && !filter_left {
-                    continue;
-                }
-                let qx = x_c + xe;
-                for k in 0..mbh_c {
-                    let y = y_c + dy * k;
-                    let (p_addr, p_in_c) = if xe == 0 {
-                        let Some(pa) =
-                            chroma_pixel_to_mb_addr(grid, qx - 1, y, sub_w, sub_h, mb_field_flags)
-                        else {
-                            continue;
-                        };
-                        (
-                            pa,
-                            in_mb_chroma_coords(grid, pa, mb_field_flags, qx - 1, y, sub_w, sub_h),
-                        )
-                    } else {
-                        (addr, ((xe - 1) as u32, k as u32))
-                    };
-                    let q_in_c = (xe as u32, k as u32);
-                    // §8.7.2.1 last paragraph — chroma bS inherits from
-                    // the corresponding luma edge: scale the MB-relative
-                    // chroma coordinates back to luma.
-                    let p_in = (
-                        (p_in_c.0 * sub_w as u32).min(15),
-                        (p_in_c.1 * sub_h as u32).min(15),
-                    );
-                    let q_in = (
-                        (q_in_c.0 * sub_w as u32).min(15),
-                        (q_in_c.1 * sub_h as u32).min(15),
-                    );
-                    let Some((bs, p_qp, q_qp)) =
-                        mbaff_edge_bs(grid, p_addr, addr, p_in, q_in, true, mb_field_flags)
-                    else {
-                        continue;
-                    };
-                    if bs == 0 {
-                        continue;
-                    }
-                    filter_chroma_set_row(
-                        pic,
-                        plane,
-                        qx,
-                        y,
-                        bs,
-                        cqp(p_qp, q_qp),
-                        alpha_off,
-                        beta_off,
-                        bit_depth_c,
-                    );
-                }
+        let base_q = y_i + dy * ye;
+        let mut cur = None;
+        for k in 0..16i32 {
+            let x = x_i + k;
+            if k % 4 == 0 {
+                let p_in = (k as u32, (ye - 1) as u32);
+                let q_in = (k as u32, ye as u32);
+                cur = bs_memo.get(grid, addr, addr, p_in, q_in, false, mb_field_flags);
             }
+            let Some((bs, p_qp, q_qp)) = cur else {
+                continue;
+            };
+            if bs == 0 {
+                continue;
+            }
+            filter_luma_set_col(
+                pic,
+                x,
+                base_q - y_off,
+                dy,
+                bs,
+                p_qp,
+                q_qp,
+                alpha_off,
+                beta_off,
+                bit_depth_y,
+            );
+        }
+    }
 
-            // Horizontal chroma edges: top MB edge (with the §8.7 step
-            // 3e-iii dual field-mode form), then internal edges at
-            // yE = 4 (4:2:0) or yE ∈ {4, 8, 12} (4:2:2).
-            if filter_top {
-                if special_top {
-                    for ye in [0i32, 1] {
-                        let base_q = y_c + 2 * ye - (ye % 2);
-                        for k in 0..mbw_c {
-                            let x = x_c + k;
-                            let py0 = base_q - 2;
-                            let Some(pa) =
-                                chroma_pixel_to_mb_addr(grid, x, py0, sub_w, sub_h, mb_field_flags)
-                            else {
-                                continue;
+    // ---- chroma edges (4:2:0 / 4:2:2) ----
+    if !chroma {
+        return;
+    }
+    let mbw_c = 16 / sub_w;
+    let mbh_c = 16 / sub_h;
+    let x_c = x_i / sub_w;
+    // §8.7.1 — yP for chroma: (yI + SubHeightC − 1) / SubHeightC.
+    let y_c = (y_i + sub_h - 1) / sub_h;
+    // Chroma lines per 4x4 luma block along a vertical / a
+    // horizontal edge.
+    let group_v = 4 / sub_h;
+    let group_h = 4 / sub_w;
+    for plane in 0..2u8 {
+        let qp_off = if plane == 0 { cb_offset } else { cr_offset };
+        let cqp = |p_qp: i32, q_qp: i32| chroma_qp_avg(p_qp, q_qp, qp_off, qp_bd_offset_c);
+
+        // Vertical chroma edges at xE ∈ {0, 4} (chroma MB is 8 wide).
+        for xe in [0i32, 4] {
+            if xe == 0 && !filter_left {
+                continue;
+            }
+            let qx = x_c + xe;
+            let per_line = xe == 0 && !left_regular;
+            let mut cur = None;
+            for k in 0..mbh_c {
+                let y = y_c + dy * k;
+                if per_line || k % group_v == 0 {
+                    cur = 'bs: {
+                        let (p_addr, p_in_c) = if xe == 0 {
+                            let Some(pa) = chroma_pixel_to_mb_addr(
+                                grid,
+                                qx - 1,
+                                y,
+                                sub_w,
+                                sub_h,
+                                mb_field_flags,
+                            ) else {
+                                break 'bs None;
                             };
-                            let p_in_c =
-                                in_mb_chroma_coords(grid, pa, mb_field_flags, x, py0, sub_w, sub_h);
-                            let p_in = (
-                                (p_in_c.0 * sub_w as u32).min(15),
-                                (p_in_c.1 * sub_h as u32).min(15),
-                            );
-                            let q_in = (
-                                (k * sub_w).clamp(0, 15) as u32,
-                                (((base_q - y_c).clamp(0, mbh_c - 1)) * sub_h).min(15) as u32,
-                            );
-                            let Some((bs, p_qp, q_qp)) =
-                                mbaff_edge_bs(grid, pa, addr, p_in, q_in, false, mb_field_flags)
-                            else {
-                                continue;
-                            };
-                            if bs == 0 {
-                                continue;
-                            }
-                            filter_chroma_set_col(
-                                pic,
-                                plane,
-                                x,
-                                base_q,
-                                2,
-                                bs,
-                                cqp(p_qp, q_qp),
-                                alpha_off,
-                                beta_off,
-                                bit_depth_c,
-                            );
-                        }
-                    }
-                } else {
-                    for k in 0..mbw_c {
-                        let x = x_c + k;
-                        let py0 = y_c - dy;
-                        let Some(pa) =
-                            chroma_pixel_to_mb_addr(grid, x, py0, sub_w, sub_h, mb_field_flags)
-                        else {
-                            continue;
+                            (
+                                pa,
+                                in_mb_chroma_coords(
+                                    grid,
+                                    pa,
+                                    mb_field_flags,
+                                    qx - 1,
+                                    y,
+                                    sub_w,
+                                    sub_h,
+                                ),
+                            )
+                        } else {
+                            (addr, ((xe - 1) as u32, k as u32))
                         };
-                        let p_in_c =
-                            in_mb_chroma_coords(grid, pa, mb_field_flags, x, py0, sub_w, sub_h);
+                        let q_in_c = (xe as u32, k as u32);
+                        // §8.7.2.1 last paragraph — chroma bS
+                        // inherits from the corresponding luma edge:
+                        // scale the MB-relative chroma coordinates
+                        // back to luma.
                         let p_in = (
                             (p_in_c.0 * sub_w as u32).min(15),
                             (p_in_c.1 * sub_h as u32).min(15),
                         );
-                        let q_in = ((k * sub_w).clamp(0, 15) as u32, 0u32);
-                        let Some((bs, p_qp, q_qp)) =
-                            mbaff_edge_bs(grid, pa, addr, p_in, q_in, false, mb_field_flags)
-                        else {
+                        let q_in = (
+                            (q_in_c.0 * sub_w as u32).min(15),
+                            (q_in_c.1 * sub_h as u32).min(15),
+                        );
+                        bs_memo.get(grid, p_addr, addr, p_in, q_in, true, mb_field_flags)
+                    };
+                }
+                let Some((bs, p_qp, q_qp)) = cur else {
+                    continue;
+                };
+                if bs == 0 {
+                    continue;
+                }
+                filter_chroma_set_row(
+                    pic,
+                    plane,
+                    qx,
+                    y - yc_off,
+                    bs,
+                    cqp(p_qp, q_qp),
+                    alpha_off,
+                    beta_off,
+                    bit_depth_c,
+                );
+            }
+        }
+
+        // Horizontal chroma edges: top MB edge (with the §8.7 step
+        // 3e-iii dual field-mode form), then internal edges at
+        // yE = 4 (4:2:0) or yE ∈ {4, 8, 12} (4:2:2).
+        if filter_top {
+            if special_top {
+                for ye in [0i32, 1] {
+                    let base_q = y_c + 2 * ye - (ye % 2);
+                    let mut cur = None;
+                    for k in 0..mbw_c {
+                        let x = x_c + k;
+                        if k % group_h == 0 {
+                            cur = 'bs: {
+                                let py0 = base_q - 2;
+                                let Some(pa) = chroma_pixel_to_mb_addr(
+                                    grid,
+                                    x,
+                                    py0,
+                                    sub_w,
+                                    sub_h,
+                                    mb_field_flags,
+                                ) else {
+                                    break 'bs None;
+                                };
+                                let p_in_c = in_mb_chroma_coords(
+                                    grid,
+                                    pa,
+                                    mb_field_flags,
+                                    x,
+                                    py0,
+                                    sub_w,
+                                    sub_h,
+                                );
+                                let p_in = (
+                                    (p_in_c.0 * sub_w as u32).min(15),
+                                    (p_in_c.1 * sub_h as u32).min(15),
+                                );
+                                let q_in = (
+                                    (k * sub_w).clamp(0, 15) as u32,
+                                    (((base_q - y_c).clamp(0, mbh_c - 1)) * sub_h).min(15) as u32,
+                                );
+                                bs_memo.get(grid, pa, addr, p_in, q_in, false, mb_field_flags)
+                            };
+                        }
+                        let Some((bs, p_qp, q_qp)) = cur else {
                             continue;
                         };
                         if bs == 0 {
@@ -10123,8 +10556,8 @@ fn deblock_mbaff_frame(
                             pic,
                             plane,
                             x,
-                            y_c,
-                            dy,
+                            base_q - yc_off,
+                            2,
                             bs,
                             cqp(p_qp, q_qp),
                             alpha_off,
@@ -10133,20 +10566,29 @@ fn deblock_mbaff_frame(
                         );
                     }
                 }
-            }
-            let internal_yes: &[i32] = if sub_h == 2 { &[4] } else { &[4, 8, 12] };
-            for &ye in internal_yes {
-                let base_q = y_c + dy * ye;
+            } else {
+                let mut cur = None;
                 for k in 0..mbw_c {
                     let x = x_c + k;
-                    let p_in = (
-                        (k * sub_w).clamp(0, 15) as u32,
-                        ((ye - 1) * sub_h).min(15) as u32,
-                    );
-                    let q_in = ((k * sub_w).clamp(0, 15) as u32, (ye * sub_h).min(15) as u32);
-                    let Some((bs, p_qp, q_qp)) =
-                        mbaff_edge_bs(grid, addr, addr, p_in, q_in, false, mb_field_flags)
-                    else {
+                    if k % group_h == 0 {
+                        cur = 'bs: {
+                            let py0 = y_c - dy;
+                            let Some(pa) =
+                                chroma_pixel_to_mb_addr(grid, x, py0, sub_w, sub_h, mb_field_flags)
+                            else {
+                                break 'bs None;
+                            };
+                            let p_in_c =
+                                in_mb_chroma_coords(grid, pa, mb_field_flags, x, py0, sub_w, sub_h);
+                            let p_in = (
+                                (p_in_c.0 * sub_w as u32).min(15),
+                                (p_in_c.1 * sub_h as u32).min(15),
+                            );
+                            let q_in = ((k * sub_w).clamp(0, 15) as u32, 0u32);
+                            bs_memo.get(grid, pa, addr, p_in, q_in, false, mb_field_flags)
+                        };
+                    }
+                    let Some((bs, p_qp, q_qp)) = cur else {
                         continue;
                     };
                     if bs == 0 {
@@ -10156,7 +10598,7 @@ fn deblock_mbaff_frame(
                         pic,
                         plane,
                         x,
-                        base_q,
+                        y_c - yc_off,
                         dy,
                         bs,
                         cqp(p_qp, q_qp),
@@ -10165,6 +10607,40 @@ fn deblock_mbaff_frame(
                         bit_depth_c,
                     );
                 }
+            }
+        }
+        let internal_yes: &[i32] = if sub_h == 2 { &[4] } else { &[4, 8, 12] };
+        for &ye in internal_yes {
+            let base_q = y_c + dy * ye;
+            let mut cur = None;
+            for k in 0..mbw_c {
+                let x = x_c + k;
+                if k % group_h == 0 {
+                    let p_in = (
+                        (k * sub_w).clamp(0, 15) as u32,
+                        ((ye - 1) * sub_h).min(15) as u32,
+                    );
+                    let q_in = ((k * sub_w).clamp(0, 15) as u32, (ye * sub_h).min(15) as u32);
+                    cur = bs_memo.get(grid, addr, addr, p_in, q_in, false, mb_field_flags);
+                }
+                let Some((bs, p_qp, q_qp)) = cur else {
+                    continue;
+                };
+                if bs == 0 {
+                    continue;
+                }
+                filter_chroma_set_col(
+                    pic,
+                    plane,
+                    x,
+                    base_q - yc_off,
+                    dy,
+                    bs,
+                    cqp(p_qp, q_qp),
+                    alpha_off,
+                    beta_off,
+                    bit_depth_c,
+                );
             }
         }
     }
@@ -10370,9 +10846,9 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
 /// `4 / SubHeightC` chroma rows of each chroma plane, once no later
 /// edge of its own row can change them.
 struct DeblockHalo {
-    luma: [i32; 64],
-    cb: [i32; 32],
-    cr: [i32; 32],
+    luma: Samples,
+    cb: Samples,
+    cr: Samples,
 }
 
 /// Per-row count of published [`DeblockHalo`] columns, with a condvar
@@ -10443,9 +10919,9 @@ impl RowProgress {
 
 /// One macroblock row's own sample rows of the picture.
 struct DeblockRowSink<'a> {
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: SamplesMut<'a>,
+    cb: SamplesMut<'a>,
+    cr: SamplesMut<'a>,
     luma_bs: &'a mut [u8],
 }
 
@@ -10454,9 +10930,9 @@ struct DeblockRowSink<'a> {
 /// back into the picture after every row is done.
 struct DeblockRowBack {
     row: usize,
-    luma: Vec<i32>,
-    cb: Vec<i32>,
-    cr: Vec<i32>,
+    luma: Samples,
+    cb: Samples,
+    cr: Samples,
 }
 
 /// §8.7 — deblock a non-MBAFF picture (ChromaArrayType 0, 1 or 2) by
@@ -10518,14 +10994,14 @@ fn deblock_rows_threaded(
     let mut luma_bs = vec![BS_NOT_DERIVED; mb_w * mb_h * 32];
     let mut sinks: Vec<Option<DeblockRowSink<'_>>> = Vec::with_capacity(mb_h);
     {
-        let mut l_rest: &mut [i32] = &mut pic.luma;
-        let mut b_rest: &mut [i32] = &mut pic.cb;
-        let mut r_rest: &mut [i32] = &mut pic.cr;
+        let mut l_rest = pic.luma.as_mut();
+        let mut b_rest = pic.cb.as_mut();
+        let mut r_rest = pic.cr.as_mut();
         let mut s_rest: &mut [u8] = &mut luma_bs;
         for _ in 0..mb_h {
-            let (l, lr) = std::mem::take(&mut l_rest).split_at_mut(16 * wu);
-            let (b, br) = std::mem::take(&mut b_rest).split_at_mut(mbh_c * cw);
-            let (r, rr) = std::mem::take(&mut r_rest).split_at_mut(mbh_c * cw);
+            let (l, lr) = l_rest.split_at(16 * wu);
+            let (b, br) = b_rest.split_at(mbh_c * cw);
+            let (r, rr) = r_rest.split_at(mbh_c * cw);
             let (s, sr) = std::mem::take(&mut s_rest).split_at_mut(mb_w * 32);
             l_rest = lr;
             b_rest = br;
@@ -10569,38 +11045,36 @@ fn deblock_rows_threaded(
                     if r >= mb_h {
                         break;
                     }
-                    let sink = sinks.lock().unwrap_or_else(|e| e.into_inner())[r]
+                    let mut sink = sinks.lock().unwrap_or_else(|e| e.into_inner())[r]
                         .take()
                         .expect("row sink taken once");
-                    band.luma[4 * wu..].copy_from_slice(sink.luma);
+                    band.luma.copy_from(4 * wu, sink.luma.slice(0..16 * wu));
                     if has_chroma {
-                        band.cb[halo_c * cw..(halo_c + mbh_c) * cw].copy_from_slice(sink.cb);
-                        band.cr[halo_c * cw..(halo_c + mbh_c) * cw].copy_from_slice(sink.cr);
+                        band.cb.copy_from(halo_c * cw, sink.cb.slice(0..mbh_c * cw));
+                        band.cr.copy_from(halo_c * cw, sink.cr.slice(0..mbh_c * cw));
                     }
                     let y_base = 16 * r as i32 - 4;
                     let yc_base = (mbh_c * r) as i32 - halo_c as i32;
                     let mut back = DeblockRowBack {
                         row: r,
-                        luma: vec![0; 4 * wu],
-                        cb: vec![0; halo_c * cw],
-                        cr: vec![0; halo_c * cw],
+                        luma: Samples::zeroed(4 * wu, bit_depth_y),
+                        cb: Samples::zeroed(halo_c * cw, bit_depth_c),
+                        cr: Samples::zeroed(halo_c * cw, bit_depth_c),
                     };
                     let publish = |band: &Picture, x: usize| {
                         let mut halo = DeblockHalo {
-                            luma: [0; 64],
-                            cb: [0; 32],
-                            cr: [0; 32],
+                            luma: Samples::zeroed(64, bit_depth_y),
+                            cb: Samples::zeroed(32, bit_depth_c),
+                            cr: Samples::zeroed(32, bit_depth_c),
                         };
                         for k in 0..4 {
                             let o = (16 + k) * wu + 16 * x;
-                            halo.luma[k * 16..k * 16 + 16].copy_from_slice(&band.luma[o..o + 16]);
+                            halo.luma.copy_from(k * 16, band.luma.slice(o..o + 16));
                         }
                         for k in 0..halo_c {
                             let o = (mbh_c + k) * cw + mbw_c * x;
-                            halo.cb[k * mbw_c..(k + 1) * mbw_c]
-                                .copy_from_slice(&band.cb[o..o + mbw_c]);
-                            halo.cr[k * mbw_c..(k + 1) * mbw_c]
-                                .copy_from_slice(&band.cr[o..o + mbw_c]);
+                            halo.cb.copy_from(k * mbw_c, band.cb.slice(o..o + mbw_c));
+                            halo.cr.copy_from(k * mbw_c, band.cr.slice(o..o + mbw_c));
                         }
                         let _ = halos[r * mb_w + x].set(halo);
                         // Wake the row below every few columns only.
@@ -10616,15 +11090,14 @@ fn deblock_rows_threaded(
                             let halo = halos[(r - 1) * mb_w + x].get().expect("published halo");
                             for k in 0..4 {
                                 let o = k * wu + 16 * x;
-                                band.luma[o..o + 16]
-                                    .copy_from_slice(&halo.luma[k * 16..k * 16 + 16]);
+                                band.luma.copy_from(o, halo.luma.slice(k * 16..k * 16 + 16));
                             }
                             for k in 0..halo_c {
                                 let o = k * cw + mbw_c * x;
-                                band.cb[o..o + mbw_c]
-                                    .copy_from_slice(&halo.cb[k * mbw_c..(k + 1) * mbw_c]);
-                                band.cr[o..o + mbw_c]
-                                    .copy_from_slice(&halo.cr[k * mbw_c..(k + 1) * mbw_c]);
+                                band.cb
+                                    .copy_from(o, halo.cb.slice(k * mbw_c..(k + 1) * mbw_c));
+                                band.cr
+                                    .copy_from(o, halo.cr.slice(k * mbw_c..(k + 1) * mbw_c));
                             }
                         }
                         let bs = &mut sink.luma_bs[x * 32..x * 32 + 32];
@@ -10671,12 +11144,12 @@ fn deblock_rows_threaded(
                             // Column x's halo rows are final for this row.
                             for k in 0..4 {
                                 let o = k * wu + 16 * x;
-                                back.luma[o..o + 16].copy_from_slice(&band.luma[o..o + 16]);
+                                back.luma.copy_from(o, band.luma.slice(o..o + 16));
                             }
                             for k in 0..halo_c {
                                 let o = k * cw + mbw_c * x;
-                                back.cb[o..o + mbw_c].copy_from_slice(&band.cb[o..o + mbw_c]);
-                                back.cr[o..o + mbw_c].copy_from_slice(&band.cr[o..o + mbw_c]);
+                                back.cb.copy_from(o, band.cb.slice(o..o + mbw_c));
+                                back.cr.copy_from(o, band.cr.slice(o..o + mbw_c));
                             }
                         }
                         if x >= 1 {
@@ -10684,12 +11157,12 @@ fn deblock_rows_threaded(
                         }
                     }
                     publish(&band, mb_w - 1);
-                    sink.luma.copy_from_slice(&band.luma[4 * wu..]);
+                    sink.luma.copy_from(band.luma.slice(4 * wu..20 * wu));
                     if has_chroma {
                         sink.cb
-                            .copy_from_slice(&band.cb[halo_c * cw..(halo_c + mbh_c) * cw]);
+                            .copy_from(band.cb.slice(halo_c * cw..(halo_c + mbh_c) * cw));
                         sink.cr
-                            .copy_from_slice(&band.cr[halo_c * cw..(halo_c + mbh_c) * cw]);
+                            .copy_from(band.cr.slice(halo_c * cw..(halo_c + mbh_c) * cw));
                     }
                     if r > 0 {
                         backs.lock().unwrap_or_else(|e| e.into_inner()).push(back);
@@ -10701,11 +11174,225 @@ fn deblock_rows_threaded(
     // The halo rows each row's top edges modified, over the row above.
     for back in backs.into_inner().unwrap_or_else(|e| e.into_inner()) {
         let y0 = 16 * back.row - 4;
-        pic.luma[y0 * wu..(y0 + 4) * wu].copy_from_slice(&back.luma);
+        pic.luma.copy_from(y0 * wu, back.luma.as_ref());
         if has_chroma {
             let c0 = mbh_c * back.row - halo_c;
-            pic.cb[c0 * cw..(c0 + halo_c) * cw].copy_from_slice(&back.cb);
-            pic.cr[c0 * cw..(c0 + halo_c) * cw].copy_from_slice(&back.cr);
+            pic.cb.copy_from(c0 * cw, back.cb.as_ref());
+            pic.cr.copy_from(c0 * cw, back.cr.as_ref());
+        }
+    }
+}
+
+/// §8.7 — deblock an MBAFF frame (ChromaArrayType 0, 1 or 2) by
+/// macroblock-pair row on up to `threads` workers, with output
+/// identical to the serial walk in increasing macroblock address.
+///
+/// The edges of pair (x, r) — its top then its bottom macroblock —
+/// read and modify the pair's own 32 rows, the three columns left of
+/// it (pair (x − 1, r), filtered just before on the same worker) and,
+/// through the top macroblock edges, up to 8 rows of pair (x, r − 1)
+/// (a field macroblock's taps step two rows; it modifies 6). Those
+/// rows of pair (x, r − 1) are final once row r − 1 has filtered pair
+/// x + 1, whose left edge modifies their last three columns. Each
+/// worker filters one pair row in a band (8 halo rows over its own
+/// 32), waits per column for the row above to publish that halo, and
+/// the halo rows it modified are written back after every row is done.
+#[allow(clippy::too_many_arguments)]
+fn deblock_mbaff_rows_threaded(
+    pic: &mut Picture,
+    grid: &MbGrid,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth_y: u32,
+    bit_depth_c: u32,
+    pps: &Pps,
+    mb_field_flags: &[bool],
+    threads: usize,
+) {
+    const HALO: usize = 8;
+    const PAIR: usize = 32;
+    let w = pic.width_in_samples as usize;
+    let mb_w = grid.width_in_mbs as usize;
+    let rows = grid.height_in_mbs as usize / 2;
+    let cat = pic.chroma_array_type;
+    let has_chroma = cat == 1 || cat == 2;
+    let (sub_w, sub_h) = chroma_subsample(cat);
+    let (cw, pair_c, halo_c, mbw_c) = if has_chroma {
+        (
+            pic.chroma_width() as usize,
+            PAIR / sub_h as usize,
+            HALO / sub_h as usize,
+            16 / sub_w as usize,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let prm = MbaffDeblockParams::new(
+        alpha_off,
+        beta_off,
+        bit_depth_y,
+        bit_depth_c,
+        pps,
+        mb_field_flags,
+    );
+
+    let mut sinks: Vec<Option<[SamplesMut<'_>; 3]>> = Vec::with_capacity(rows);
+    {
+        let mut l_rest = pic.luma.as_mut();
+        let mut b_rest = pic.cb.as_mut();
+        let mut r_rest = pic.cr.as_mut();
+        for _ in 0..rows {
+            let (l, lr) = l_rest.split_at(PAIR * w);
+            let (b, br) = b_rest.split_at(pair_c * cw);
+            let (r, rr) = r_rest.split_at(pair_c * cw);
+            l_rest = lr;
+            b_rest = br;
+            r_rest = rr;
+            sinks.push(Some([l, b, r]));
+        }
+    }
+    let sinks = std::sync::Mutex::new(sinks);
+    let halos: Vec<std::sync::OnceLock<DeblockHalo>> = (0..mb_w * rows)
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let progress = RowProgress::new(rows);
+    let next_row = std::sync::atomic::AtomicUsize::new(0);
+    let backs: std::sync::Mutex<Vec<DeblockRowBack>> = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(rows) {
+            let (sinks, halos, progress, next_row, backs, prm) =
+                (&sinks, &halos, &progress, &next_row, &backs, &prm);
+            scope.spawn(move || {
+                // A panicking worker must release the rows waiting on it.
+                struct Unblock<'p>(&'p RowProgress);
+                impl Drop for Unblock<'_> {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            self.0.abort();
+                        }
+                    }
+                }
+                let _unblock = Unblock(progress);
+                let mut band = Picture::new(
+                    w as u32,
+                    (HALO + PAIR) as u32,
+                    cat,
+                    bit_depth_y,
+                    bit_depth_c,
+                );
+                let mut bs_memo = MbaffBsMemo::new();
+                loop {
+                    let r = next_row.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if r >= rows {
+                        break;
+                    }
+                    let [mut luma, mut cb, mut cr] =
+                        sinks.lock().unwrap_or_else(|e| e.into_inner())[r]
+                            .take()
+                            .expect("row sink taken once");
+                    band.luma.copy_from(HALO * w, luma.slice(0..PAIR * w));
+                    if has_chroma {
+                        band.cb.copy_from(halo_c * cw, cb.slice(0..pair_c * cw));
+                        band.cr.copy_from(halo_c * cw, cr.slice(0..pair_c * cw));
+                    }
+                    let y_base = (PAIR * r) as i32 - HALO as i32;
+                    let yc_base = (pair_c * r) as i32 - halo_c as i32;
+                    let mut back = DeblockRowBack {
+                        row: r,
+                        luma: Samples::zeroed(HALO * w, bit_depth_y),
+                        cb: Samples::zeroed(halo_c * cw, bit_depth_c),
+                        cr: Samples::zeroed(halo_c * cw, bit_depth_c),
+                    };
+                    let publish = |band: &Picture, x: usize| {
+                        let mut halo = DeblockHalo {
+                            luma: Samples::zeroed(HALO * 16, bit_depth_y),
+                            cb: Samples::zeroed(halo_c * mbw_c, bit_depth_c),
+                            cr: Samples::zeroed(halo_c * mbw_c, bit_depth_c),
+                        };
+                        for k in 0..HALO {
+                            let o = (PAIR + k) * w + 16 * x;
+                            halo.luma.copy_from(k * 16, band.luma.slice(o..o + 16));
+                        }
+                        for k in 0..halo_c {
+                            let o = (pair_c + k) * cw + mbw_c * x;
+                            halo.cb.copy_from(k * mbw_c, band.cb.slice(o..o + mbw_c));
+                            halo.cr.copy_from(k * mbw_c, band.cr.slice(o..o + mbw_c));
+                        }
+                        let _ = halos[r * mb_w + x].set(halo);
+                        // Wake the row below every few columns only.
+                        if (x + 1).is_multiple_of(4) || x + 1 == mb_w {
+                            progress.publish(r, x + 1);
+                        }
+                    };
+                    for x in 0..mb_w {
+                        if r > 0 {
+                            if !progress.wait_for(r - 1, x + 1) {
+                                return;
+                            }
+                            let halo = halos[(r - 1) * mb_w + x].get().expect("published halo");
+                            for k in 0..HALO {
+                                let o = k * w + 16 * x;
+                                band.luma.copy_from(o, halo.luma.slice(k * 16..k * 16 + 16));
+                            }
+                            for k in 0..halo_c {
+                                let o = k * cw + mbw_c * x;
+                                band.cb
+                                    .copy_from(o, halo.cb.slice(k * mbw_c..(k + 1) * mbw_c));
+                                band.cr
+                                    .copy_from(o, halo.cr.slice(k * mbw_c..(k + 1) * mbw_c));
+                            }
+                        }
+                        let top = 2 * (r * mb_w + x) as u32;
+                        for addr in [top, top + 1] {
+                            deblock_mbaff_mb(
+                                &mut band,
+                                y_base,
+                                yc_base,
+                                grid,
+                                addr,
+                                prm,
+                                &mut bs_memo,
+                            );
+                        }
+                        if r > 0 {
+                            // Column x's halo rows are final for this row.
+                            for k in 0..HALO {
+                                let o = k * w + 16 * x;
+                                back.luma.copy_from(o, band.luma.slice(o..o + 16));
+                            }
+                            for k in 0..halo_c {
+                                let o = k * cw + mbw_c * x;
+                                back.cb.copy_from(o, band.cb.slice(o..o + mbw_c));
+                                back.cr.copy_from(o, band.cr.slice(o..o + mbw_c));
+                            }
+                        }
+                        if x >= 1 {
+                            publish(&band, x - 1);
+                        }
+                    }
+                    publish(&band, mb_w - 1);
+                    luma.copy_from(band.luma.slice(HALO * w..(HALO + PAIR) * w));
+                    if has_chroma {
+                        cb.copy_from(band.cb.slice(halo_c * cw..(halo_c + pair_c) * cw));
+                        cr.copy_from(band.cr.slice(halo_c * cw..(halo_c + pair_c) * cw));
+                    }
+                    if r > 0 {
+                        backs.lock().unwrap_or_else(|e| e.into_inner()).push(back);
+                    }
+                }
+            });
+        }
+    });
+    // The halo rows each pair row's top edges modified, over the row
+    // above.
+    for back in backs.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        let y0 = PAIR * back.row - HALO;
+        pic.luma.copy_from(y0 * w, back.luma.as_ref());
+        if has_chroma {
+            let c0 = pair_c * back.row - halo_c;
+            pic.cb.copy_from(c0 * cw, back.cb.as_ref());
+            pic.cr.copy_from(c0 * cw, back.cr.as_ref());
         }
     }
 }
@@ -11070,6 +11757,12 @@ fn deblock_luma_mb_frame(
     if !q_info.available {
         return;
     }
+    // §8.7.2.1 — bS of every edge segment. An intra / SP / SI side
+    // settles a whole edge (bS 4 on a macroblock edge of a frame, or a
+    // vertical one of a field; 3 otherwise); else a segment takes bS 2
+    // when either 4x4 block has non-zero coefficients, else 1 when the
+    // blocks' references / motion differ, else 0.
+    let q_nz = raster_nonzero_mask(q_info.luma_nonzero_4x4);
     let mut q_uniform: Option<bool> = None;
     for vertical in [true, false] {
         // The neighbouring macroblock across this direction's MB edge.
@@ -11101,6 +11794,11 @@ fn deblock_luma_mb_frame(
             luma_bs[base + 4..base + 16].fill(0);
         }
         let max_edge = if skip_internal { 1i32 } else { 4i32 };
+        // Segments of each edge inside the picture.
+        let along0 = (if vertical { mb_y } else { mb_x }) * 16;
+        let segs = ((if vertical { h } else { w }) - along0 + 3)
+            .div_euclid(4)
+            .clamp(0, 4);
         for edge_off in 0..max_edge {
             let edge = edge_mb * 16 + edge_off * 4;
             if edge == 0 || edge >= if vertical { w } else { h } {
@@ -11118,77 +11816,167 @@ fn deblock_luma_mb_frame(
             if !is_mb_edge && (edge_off == 1 || edge_off == 3) && q_info.transform_size_8x8_flag {
                 continue;
             }
-            let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
-            for seg in 0..4i32 {
-                let along = (if vertical { mb_y } else { mb_x }) * 16 + seg * 4;
-                if along >= if vertical { h } else { w } {
-                    break;
+            let slot = |seg: i32| luma_bs_index(0, 0, 0, !vertical, edge_off, seg);
+            if p_info.is_intra || q_info.is_intra || p_info.in_sp_si_slice || q_info.in_sp_si_slice
+            {
+                let bs = if is_mb_edge && (!field_pic || vertical) {
+                    4
+                } else {
+                    3
+                };
+                for seg in 0..segs {
+                    luma_bs[slot(seg)] = bs;
                 }
+                continue;
+            }
+            let p_nz = if is_mb_edge {
+                raster_nonzero_mask(p_info.luma_nonzero_4x4)
+            } else {
+                q_nz
+            };
+            let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
+            // Motion of an edge between two macroblocks whose 4x4
+            // blocks all move alike is the same on every segment.
+            let mut uniform_edge: Option<bool> = None;
+            let both_uniform = if is_mb_edge {
+                uniform_motion(p_info) && *q_uniform.get_or_insert_with(|| uniform_motion(q_info))
+            } else {
+                *q_uniform.get_or_insert_with(|| uniform_motion(q_info))
+            };
+            for seg in 0..segs {
                 // 4x4 block coordinates (x, y) inside the p / q MBs.
                 let (pbx, pby, qbx, qby) = if vertical {
                     (p_off, seg as u32, edge_off as u32, seg as u32)
                 } else {
                     (seg as u32, p_off, seg as u32, edge_off as u32)
                 };
-                let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8) as usize;
-                let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8) as usize;
-                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
-                    && !(!is_mb_edge && *q_uniform.get_or_insert_with(|| uniform_motion(q_info)))
-                    && different_ref_or_mv_luma(
-                        p_info,
-                        q_info,
-                        pbx * 4,
-                        pby * 4,
-                        qbx * 4,
-                        qby * 4,
-                        field_pic,
-                    );
-                let bs = derive_boundary_strength(BsInputs {
-                    p_is_intra: p_info.is_intra,
-                    q_is_intra: q_info.is_intra,
-                    is_mb_edge,
-                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                    different_ref_or_mv: diff_ref_mv,
-                    mixed_mode_edge: false,
-                    vertical_edge: vertical,
-                    mbaff_or_field: field_pic,
-                    both_in_frame_mbs: !field_pic,
-                });
-                luma_bs[luma_bs_index(0, 0, 0, !vertical, edge_off, seg)] = bs;
-                if bs == 0 {
-                    continue;
-                }
-                if vertical {
-                    filter_vertical_edge_luma(
-                        pic,
-                        edge,
-                        along - y_base,
-                        bs,
-                        p_info.qp_y,
-                        q_info.qp_y,
-                        alpha_off,
-                        beta_off,
-                        bit_depth,
-                    );
+                let nz = (p_nz >> (pby * 4 + pbx)) & 1 != 0 || (q_nz >> (qby * 4 + qbx)) & 1 != 0;
+                let bs = if nz {
+                    2
+                } else if !is_mb_edge && both_uniform {
+                    0
                 } else {
-                    filter_horizontal_edge_luma(
-                        pic,
-                        along,
-                        edge - y_base,
-                        bs,
-                        p_info.qp_y,
-                        q_info.qp_y,
-                        alpha_off,
-                        beta_off,
-                        bit_depth,
-                    );
-                }
+                    let differ = |pbx: u32, pby: u32, qbx: u32, qby: u32| {
+                        different_ref_or_mv_luma(
+                            p_info,
+                            q_info,
+                            pbx * 4,
+                            pby * 4,
+                            qbx * 4,
+                            qby * 4,
+                            field_pic,
+                        )
+                    };
+                    let d = if both_uniform {
+                        *uniform_edge.get_or_insert_with(|| differ(pbx, pby, qbx, qby))
+                    } else {
+                        differ(pbx, pby, qbx, qby)
+                    };
+                    u8::from(d)
+                };
+                luma_bs[slot(seg)] = bs;
             }
         }
     }
+    // §8.7.2 — filter the edges whose bS the walk above recorded:
+    // vertical edges left to right, then horizontal top to bottom.
+    let stride = pic.width_in_samples as usize;
+    let left_qp = (mb_x > 0).then(|| grid.info[addr - 1].qp_y);
+    let top_qp = (mb_y > 0).then(|| grid.info[addr - mb_w as usize].qp_y);
+    let edges = FrameMbEdges {
+        luma_bs,
+        q_qp: q_info.qp_y,
+        left_qp,
+        top_qp,
+        alpha_off,
+        beta_off,
+        bit_depth,
+        max: (1i32 << bit_depth) - 1,
+    };
+    let x0 = mb_x as usize * 16;
+    let y0 = (mb_y * 16 - y_base) as usize;
+    match &mut pic.luma {
+        Samples::U8(v) => edges.filter_luma(v, stride, x0, y0),
+        Samples::U16(v) => edges.filter_luma(v, stride, x0, y0),
+    }
+}
+
+/// The recorded luma bS of one macroblock of a non-MBAFF picture and
+/// the QP_Y values its edges average (§8.7.2.2 eq. 8-453), for the
+/// line-parallel edge filters.
+struct FrameMbEdges<'a> {
+    luma_bs: &'a [u8],
+    q_qp: i32,
+    /// QP_Y of the left / upper macroblock (`None` at the picture edge).
+    left_qp: Option<i32>,
+    top_qp: Option<i32>,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    max: i32,
+}
+
+impl FrameMbEdges<'_> {
+    /// The bS of segment `seg` of edge `edge` (`horizontal` direction),
+    /// 0 when the walk did not record it.
+    #[inline]
+    fn bs(&self, horizontal: bool, edge: i32, seg: i32) -> i32 {
+        match self.luma_bs[luma_bs_index(0, 0, 0, horizontal, edge, seg)] {
+            BS_NOT_DERIVED => 0,
+            b => b as i32,
+        }
+    }
+
+    /// Luma: the macroblock's samples start at `buf[y0 * stride + x0]`.
+    fn filter_luma<S: Sample>(&self, buf: &mut [S], stride: usize, x0: usize, y0: usize) {
+        for horizontal in [false, true] {
+            for edge in 0..4i32 {
+                let mut bs = [0i32; EDGE_LINES];
+                for (k, b) in bs.iter_mut().enumerate() {
+                    *b = self.bs(horizontal, edge, k as i32 / 4);
+                }
+                if bs.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                let p_qp = match (edge, horizontal) {
+                    (0, false) => self.left_qp,
+                    (0, true) => self.top_qp,
+                    _ => Some(self.q_qp),
+                };
+                let Some(p_qp) = p_qp else { continue };
+                let qp_avg = (p_qp + self.q_qp + 1) >> 1;
+                let Some((alpha, beta, index_a)) =
+                    edge_alpha_beta(qp_avg, self.alpha_off, self.beta_off, self.bit_depth)
+                else {
+                    continue;
+                };
+                let tc0: [i32; EDGE_LINES] = tc0_lanes(&bs, index_a, self.bit_depth);
+                let (q0, across, along) = if horizontal {
+                    ((y0 + 4 * edge as usize) * stride + x0, stride, 1)
+                } else {
+                    (y0 * stride + x0 + 4 * edge as usize, 1, stride)
+                };
+                let mut lines = EdgeLines::<EDGE_LINES>::new();
+                lines.load(buf, q0, across, along, EDGE_LINES, 4);
+                filter_lines_luma(&mut lines, &bs, &tc0, alpha, beta, self.max);
+                lines.store(buf, q0, across, along, EDGE_LINES, 3);
+            }
+        }
+    }
+}
+
+/// A macroblock's `luma_nonzero_4x4` (bit = Figure 6-10 4x4 block
+/// index) re-laid in raster order: bit `by * 4 + bx` for the 4x4 block
+/// at (`bx`, `by`).
+#[inline]
+fn raster_nonzero_mask(z: u16) -> u16 {
+    let mut r = 0u16;
+    for (blk, &(x, y)) in LUMA_4X4_XY.iter().enumerate() {
+        if (z >> blk) & 1 != 0 {
+            r |= 1 << ((y / 4) * 4 + x / 4);
+        }
+    }
+    r
 }
 
 /// §8.7.2.1 — whether every 4x4 block of a macroblock has the same
@@ -11305,90 +12093,24 @@ fn deblock_chroma_mb(
     mb_field_flags: &[bool],
     luma_bs: &[u8],
 ) {
-    if !mbaff_frame_flag && pic.chroma_array_type == 1 && !deblock_trace_enabled() {
-        let v0 = mb_x > 0 && luma_bs[0..4].iter().any(|&b| b > 0 && b != BS_NOT_DERIVED);
-        let v2 = luma_bs[8..12] != [0; 4];
-        let h0 = mb_y > 0 && luma_bs[16..20].iter().any(|&b| b > 0 && b != BS_NOT_DERIVED);
-        let h2 = luma_bs[24..28] != [0; 4];
-        if !(v0 || v2 || h0 || h2) {
-            return;
-        }
-        let mb_w = grid.width_in_mbs as usize;
-        let addr = mb_y as usize * mb_w + mb_x as usize;
-        let Some(q_info) = grid.info.get(addr).filter(|i| i.available) else {
-            return;
-        };
-        let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
-        let c_off = if plane == 0 { cb_offset } else { cr_offset };
-        if v0
-            && mb_x * 8 < cw
-            && let Some(p_info) = grid.info.get(addr - 1).filter(|i| i.available)
-        {
-            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
-            for sub in 0..4usize {
-                let y0 = mb_y * 8 + (sub * 2) as i32;
-                if y0 >= ch {
-                    break;
-                }
-                let bs = luma_bs[sub];
-                if bs > 0 && bs != BS_NOT_DERIVED {
-                    filter_chroma_vertical_rows(
-                        pic, plane, mb_x * 8, y0 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
-                        bit_depth,
-                    );
-                }
-            }
-        }
-        if v2 && mb_x * 8 + 4 < cw {
-            let qp_avg = chroma_qp_avg(q_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
-            for sub in 0..4usize {
-                let y0 = mb_y * 8 + (sub * 2) as i32;
-                if y0 >= ch {
-                    break;
-                }
-                let bs = luma_bs[8 + sub];
-                if bs > 0 && bs != BS_NOT_DERIVED {
-                    filter_chroma_vertical_rows(
-                        pic, plane, mb_x * 8 + 4, y0 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
-                        bit_depth,
-                    );
-                }
-            }
-        }
-        if h0
-            && mb_y * 8 < ch
-            && let Some(p_info) = grid.info.get(addr - mb_w).filter(|i| i.available)
-        {
-            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
-            for sub in 0..4usize {
-                let x0 = mb_x * 8 + (sub * 2) as i32;
-                if x0 >= cw {
-                    break;
-                }
-                let bs = luma_bs[16 + sub];
-                if bs > 0 && bs != BS_NOT_DERIVED {
-                    filter_chroma_horizontal_cols(
-                        pic, plane, x0, mb_y * 8 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
-                        bit_depth,
-                    );
-                }
-            }
-        }
-        if h2 && mb_y * 8 + 4 < ch {
-            let qp_avg = chroma_qp_avg(q_info.qp_y, q_info.qp_y, c_off, qp_bd_offset_c);
-            for sub in 0..4usize {
-                let x0 = mb_x * 8 + (sub * 2) as i32;
-                if x0 >= cw {
-                    break;
-                }
-                let bs = luma_bs[24 + sub];
-                if bs > 0 && bs != BS_NOT_DERIVED {
-                    filter_chroma_horizontal_cols(
-                        pic, plane, x0, mb_y * 8 + 4 - y_base, 2, bs, qp_avg, alpha_off, beta_off,
-                        bit_depth,
-                    );
-                }
-            }
+    if !mbaff_frame_flag && matches!(pic.chroma_array_type, 1 | 2) {
+        // Both planes at the Cb call (they are filtered independently).
+        if plane == 0 {
+            deblock_chroma_mb_frame(
+                pic,
+                y_base,
+                cw,
+                ch,
+                grid,
+                mb_x,
+                mb_y,
+                alpha_off,
+                beta_off,
+                bit_depth,
+                [cb_offset, cr_offset],
+                field_pic,
+                luma_bs,
+            );
         }
         return;
     }
@@ -11696,6 +12418,203 @@ fn deblock_chroma_mb(
             }
         }
     }
+}
+
+/// [`deblock_chroma_mb`] for a picture that is not an MBAFF frame
+/// (ChromaArrayType 1 or 2): every chroma edge segment takes the bS of
+/// its luma segment (§8.7.2.1, last paragraph) as the macroblock's luma
+/// walk recorded it in `luma_bs`; a luma edge the walk skips because of
+/// `transform_size_8x8_flag` (a 4:2:2 chroma edge at luma rows 4 / 12)
+/// derives its bS here. The edges are filtered line-parallel.
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma_mb_frame(
+    pic: &mut Picture,
+    y_base: i32,
+    cw: i32,
+    ch: i32,
+    grid: &MbGrid,
+    mb_x: i32,
+    mb_y: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    qp_offsets: [i32; 2],
+    field_pic: bool,
+    luma_bs: &[u8],
+) {
+    let mb_w = grid.width_in_mbs as i32;
+    let mb_h = grid.height_in_mbs as i32;
+    if mb_x < 0 || mb_y < 0 || mb_x >= mb_w || mb_y >= mb_h {
+        return;
+    }
+    let addr = (mb_y * mb_w + mb_x) as usize;
+    let q_info = &grid.info[addr];
+    if !q_info.available {
+        return;
+    }
+    let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
+    let sub_h = if pic.chroma_array_type == 1 { 2 } else { 1 };
+    let mbh_c = 16 / sub_h;
+    let stride = pic.chroma_width() as usize;
+    let max = (1i32 << bit_depth) - 1;
+    let x0 = mb_x as usize * 8;
+    let y0 = (mb_y * mbh_c - y_base) as usize;
+    // Edge list: (horizontal, chroma edge offset, luma edge index).
+    let mut edges: [(bool, i32, i32); 6] = [(false, 0, 0); 6];
+    let mut n_edges = 0;
+    for off in [0, 4] {
+        edges[n_edges] = (false, off, off * 2 / 4);
+        n_edges += 1;
+    }
+    for off in (0..mbh_c).step_by(4) {
+        edges[n_edges] = (true, off, off * sub_h / 4);
+        n_edges += 1;
+    }
+    for &(horizontal, off, luma_edge) in &edges[..n_edges] {
+        let pos = if horizontal {
+            mb_y * mbh_c + off
+        } else {
+            mb_x * 8 + off
+        };
+        if pos == 0 || pos >= if horizontal { ch } else { cw } {
+            continue;
+        }
+        let neighbour = match (off, horizontal) {
+            (0, false) => grid.info.get(addr - 1),
+            (0, true) => grid.info.get(addr - mb_w as usize),
+            _ => Some(q_info),
+        };
+        let Some(p_info) = neighbour.filter(|p| p.available) else {
+            continue;
+        };
+        let lines = if horizontal { 8 } else { mbh_c as usize };
+        let mut bs = [0i32; EDGE_LINES];
+        for (k, b) in bs.iter_mut().enumerate().take(lines) {
+            // The luma segment of chroma line k (SubWidthC = 2 across
+            // a horizontal edge, SubHeightC down a vertical one).
+            let seg = if horizontal {
+                k / 2
+            } else {
+                k * sub_h as usize / 4
+            } as i32;
+            let recorded = luma_bs[luma_bs_index(0, 0, 0, horizontal, luma_edge, seg)];
+            *b = if recorded != BS_NOT_DERIVED {
+                recorded as i32
+            } else if off != 0 {
+                // An internal luma edge skipped for the 8x8 transform.
+                let (pbx, pby, qbx, qby) = if horizontal {
+                    (
+                        seg as u32,
+                        luma_edge as u32 - 1,
+                        seg as u32,
+                        luma_edge as u32,
+                    )
+                } else {
+                    (
+                        luma_edge as u32 - 1,
+                        seg as u32,
+                        luma_edge as u32,
+                        seg as u32,
+                    )
+                };
+                internal_edge_bs(q_info, pbx, pby, qbx, qby, !horizontal, field_pic) as i32
+            } else {
+                0
+            };
+        }
+        if bs.iter().all(|&b| b == 0) {
+            continue;
+        }
+        let (q0, across, along) = if horizontal {
+            ((y0 + off as usize) * stride + x0, stride, 1)
+        } else {
+            (y0 * stride + x0 + off as usize, 1, stride)
+        };
+        // Both chroma planes, each with its own QPC (§8.7.2.2).
+        for (plane, &qp_offset) in qp_offsets.iter().enumerate() {
+            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, qp_offset, qp_bd_offset_c);
+            let Some((alpha, beta, index_a)) =
+                edge_alpha_beta(qp_avg, alpha_off, beta_off, bit_depth)
+            else {
+                continue;
+            };
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            if lines == 8 {
+                let bs8: [i32; 8] = std::array::from_fn(|k| bs[k]);
+                chroma_edge_lines(
+                    buf, &bs8, index_a, alpha, beta, bit_depth, max, q0, across, along,
+                );
+            } else {
+                chroma_edge_lines(
+                    buf, &bs, index_a, alpha, beta, bit_depth, max, q0, across, along,
+                );
+            }
+        }
+    }
+}
+
+/// Filter `N` lines of one chroma edge of a stored plane
+/// chroma-style (see [`filter_lines_chroma`]).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn chroma_edge_lines<const N: usize>(
+    buf: &mut Samples,
+    bs: &[i32; N],
+    index_a: i32,
+    alpha: i32,
+    beta: i32,
+    bit_depth: u32,
+    max: i32,
+    q0: usize,
+    across: usize,
+    along: usize,
+) {
+    let tc0 = tc0_lanes(bs, index_a, bit_depth);
+    let mut e = EdgeLines::<N>::new();
+    match buf {
+        Samples::U8(v) => {
+            e.load(v, q0, across, along, N, 2);
+            filter_lines_chroma(&mut e, bs, &tc0, alpha, beta, max);
+            e.store(v, q0, across, along, N, 1);
+        }
+        Samples::U16(v) => {
+            e.load(v, q0, across, along, N, 2);
+            filter_lines_chroma(&mut e, bs, &tc0, alpha, beta, max);
+            e.store(v, q0, across, along, N, 1);
+        }
+    }
+}
+
+/// §8.7.2.1 — bS of a luma edge segment between the 4x4 blocks
+/// (`pbx`, `pby`) and (`qbx`, `qby`) of one macroblock of a non-MBAFF
+/// picture (an internal edge).
+fn internal_edge_bs(
+    info: &MbInfo,
+    pbx: u32,
+    pby: u32,
+    qbx: u32,
+    qby: u32,
+    vertical: bool,
+    field_pic: bool,
+) -> u8 {
+    let p_blk4 = blk4_raster_index(pbx as u8, pby as u8) as usize;
+    let q_blk4 = blk4_raster_index(qbx as u8, qby as u8) as usize;
+    let p_has_nz = (info.luma_nonzero_4x4 >> p_blk4) & 1 == 1;
+    let q_has_nz = (info.luma_nonzero_4x4 >> q_blk4) & 1 == 1;
+    let diff_ref_mv = !(info.is_intra || p_has_nz || q_has_nz)
+        && different_ref_or_mv_luma(info, info, pbx * 4, pby * 4, qbx * 4, qby * 4, field_pic);
+    derive_boundary_strength(BsInputs {
+        p_is_intra: info.is_intra,
+        q_is_intra: info.is_intra,
+        is_mb_edge: false,
+        is_sp_or_si: info.in_sp_si_slice,
+        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+        different_ref_or_mv: diff_ref_mv,
+        mixed_mode_edge: false,
+        vertical_edge: vertical,
+        mbaff_or_field: field_pic,
+        both_in_frame_mbs: !field_pic,
+    })
 }
 
 /// §8.5.8 / §8.7.2.2 eq. 8-453 — (QPc(p) + QPc(q) + 1) >> 1 for chroma.
@@ -12028,6 +12947,22 @@ fn filter_vertical_edge_plane_luma_style(
         bit_depth,
     };
     let pic_h = pic.height_in_samples as i32;
+    let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + 4 <= ch {
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            filter_stored_lines(
+                buf,
+                ef,
+                y0 as usize * stride + edge_x as usize,
+                1,
+                stride,
+                4,
+            );
+        }
+        return;
+    }
     for dy in 0..4 {
         let y = y0 + dy;
         if y < 0 || y >= pic_h {
@@ -12090,6 +13025,22 @@ fn filter_horizontal_edge_plane_luma_style(
         bit_depth,
     };
     let pic_w = pic.width_in_samples as i32;
+    let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    if x0 >= 0 && x0 + 4 <= cw && edge_y >= 4 && edge_y + 4 <= ch {
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            filter_stored_lines(
+                buf,
+                ef,
+                edge_y as usize * stride + x0 as usize,
+                stride,
+                1,
+                4,
+            );
+        }
+        return;
+    }
     for dx in 0..4 {
         let x = x0 + dx;
         if x < 0 || x >= pic_w {
@@ -12127,6 +13078,23 @@ fn filter_horizontal_edge_plane_luma_style(
         plane_set(pic, plane, x, edge_y, q0);
         plane_set(pic, plane, x, edge_y + 1, q1);
         plane_set(pic, plane, x, edge_y + 2, q2);
+    }
+}
+
+/// §8.7.2 — filter `lines` lines of one edge segment of a stored plane
+/// (see [`EdgeFilter::lines`]).
+#[inline]
+fn filter_stored_lines(
+    plane: &mut Samples,
+    ef: EdgeFilter,
+    q0: usize,
+    across: usize,
+    along: usize,
+    lines: usize,
+) {
+    match plane {
+        Samples::U8(v) => ef.lines(v, q0, across, along, lines),
+        Samples::U16(v) => ef.lines(v, q0, across, along, lines),
     }
 }
 
@@ -12192,39 +13160,16 @@ fn filter_vertical_edge_luma(
     // edges), we can take a contiguous &mut [i32] slice and avoid the
     // per-pixel bounds-checked accessors.
     if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
-        let stride = pic_w as usize;
-        let base_x = (edge_x - 4) as usize;
-        let y = y0 as usize;
-        let mut p3 = [0i32; 4];
-        let mut p2 = [0i32; 4];
-        let mut p1 = [0i32; 4];
-        let mut p0 = [0i32; 4];
-        let mut q0 = [0i32; 4];
-        let mut q1 = [0i32; 4];
-        let mut q2 = [0i32; 4];
-        let mut q3 = [0i32; 4];
-        for dy in 0..4 {
-            let r = &pic.luma[(y + dy) * stride + base_x..(y + dy) * stride + base_x + 8];
-            p3[dy] = r[0];
-            p2[dy] = r[1];
-            p1[dy] = r[2];
-            p0[dy] = r[3];
-            q0[dy] = r[4];
-            q1[dy] = r[5];
-            q2[dy] = r[6];
-            q3[dy] = r[7];
-        }
-        crate::deblock::filter_luma_4(
-            p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, q3, params,
-        );
-        for dy in 0..4 {
-            let r = &mut pic.luma[(y + dy) * stride + base_x + 1..(y + dy) * stride + base_x + 7];
-            r[0] = p2[dy];
-            r[1] = p1[dy];
-            r[2] = p0[dy];
-            r[3] = q0[dy];
-            r[4] = q1[dy];
-            r[5] = q2[dy];
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = pic_w as usize;
+            filter_stored_lines(
+                &mut pic.luma,
+                ef,
+                y0 as usize * stride + edge_x as usize,
+                1,
+                stride,
+                4,
+            );
         }
         return;
     }
@@ -12298,29 +13243,17 @@ fn filter_horizontal_edge_luma(
     let pic_w = pic.width_in_samples as i32;
     let pic_h = pic.height_in_samples as i32;
     if x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
-        let stride = pic_w as usize;
-        let x = x0 as usize;
-        let ey = edge_y as usize;
-        let get4 = |luma: &[i32], row: usize| -> [i32; 4] {
-            luma[row * stride + x..row * stride + x + 4].try_into().unwrap()
-        };
-        let p3 = get4(&pic.luma, ey - 4);
-        let mut p2 = get4(&pic.luma, ey - 3);
-        let mut p1 = get4(&pic.luma, ey - 2);
-        let mut p0 = get4(&pic.luma, ey - 1);
-        let mut q0 = get4(&pic.luma, ey);
-        let mut q1 = get4(&pic.luma, ey + 1);
-        let mut q2 = get4(&pic.luma, ey + 2);
-        let q3 = get4(&pic.luma, ey + 3);
-        crate::deblock::filter_luma_4(
-            p3, &mut p2, &mut p1, &mut p0, &mut q0, &mut q1, &mut q2, q3, params,
-        );
-        pic.luma[(ey - 3) * stride + x..(ey - 3) * stride + x + 4].copy_from_slice(&p2);
-        pic.luma[(ey - 2) * stride + x..(ey - 2) * stride + x + 4].copy_from_slice(&p1);
-        pic.luma[(ey - 1) * stride + x..(ey - 1) * stride + x + 4].copy_from_slice(&p0);
-        pic.luma[ey * stride + x..ey * stride + x + 4].copy_from_slice(&q0);
-        pic.luma[(ey + 1) * stride + x..(ey + 1) * stride + x + 4].copy_from_slice(&q1);
-        pic.luma[(ey + 2) * stride + x..(ey + 2) * stride + x + 4].copy_from_slice(&q2);
+        if let Some(ef) = EdgeFilter::new(params, false) {
+            let stride = pic_w as usize;
+            filter_stored_lines(
+                &mut pic.luma,
+                ef,
+                edge_y as usize * stride + x0 as usize,
+                stride,
+                1,
+                4,
+            );
+        }
         return;
     }
     for dx in 0..4 {
@@ -12391,39 +13324,11 @@ fn filter_chroma_vertical_rows(
     };
     // Fast in-bounds path for the chroma edge.
     if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
-        let stride = cw as usize;
-        let base_x = (edge_x - 4) as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
-        for dy in 0..rows {
-            let y = (y0 + dy) as usize;
-            let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            // Chroma-style filter only updates p1/p0/q0/q1.
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
+        if let Some(ef) = EdgeFilter::new(params, true) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            let q0 = y0 as usize * stride + edge_x as usize;
+            filter_stored_lines(buf, ef, q0, 1, stride, rows as usize);
         }
         return;
     }
@@ -12508,36 +13413,11 @@ fn filter_chroma_horizontal_cols(
     };
     // Fast in-bounds path.
     if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
-        let stride = cw as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
-        for dx in 0..cols {
-            let x = (x0 + dx) as usize;
-            let p3 = buf[((edge_y - 4) as usize) * stride + x];
-            let q3 = buf[((edge_y + 3) as usize) * stride + x];
-            let mut p2 = buf[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = buf[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = buf[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = buf[((edge_y) as usize) * stride + x];
-            let mut q1 = buf[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = buf[((edge_y + 2) as usize) * stride + x];
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            buf[((edge_y - 2) as usize) * stride + x] = p1;
-            buf[((edge_y - 1) as usize) * stride + x] = p0;
-            buf[((edge_y) as usize) * stride + x] = q0;
-            buf[((edge_y + 1) as usize) * stride + x] = q1;
+        if let Some(ef) = EdgeFilter::new(params, true) {
+            let stride = cw as usize;
+            let buf = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+            let q0 = edge_y as usize * stride + x0 as usize;
+            filter_stored_lines(buf, ef, q0, stride, 1, cols as usize);
         }
         return;
     }
@@ -12611,6 +13491,12 @@ pub(crate) struct FtSlicePlan {
     pub(crate) inter: Vec<InterMbJob>,
     /// `(index into the slice's macroblocks, mbAddr, QP_Y)`.
     pub(crate) intra: Vec<(usize, u32, i32)>,
+    /// Inter macroblocks whose §8.4.1 motion is still to be derived
+    /// ([`ft_motion_stage`]), as `intra`.
+    pub(crate) pending: Vec<(usize, u32, i32)>,
+    /// Number of the slice's macroblocks the decoding-order pass
+    /// accepted (all before the first failing one).
+    pub(crate) accepted: usize,
 }
 
 impl InterMbJob {
@@ -12698,7 +13584,19 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
     ref_pics: &R,
     chroma_array_type: u32,
 ) -> Result<(), ReconstructError> {
-    for (part, _, _) in parts {
+    for_each_ref_use(parts.iter().map(|(p, _, _)| p), |list, idx| {
+        ft_validate_ref(ref_pics, list, idx, chroma_array_type)
+    })
+}
+
+/// Every (list, refIdxLX) the partitions predict from, in decoding
+/// order (each partition's list 0, then list 1); stops at the first
+/// error `f` returns.
+fn for_each_ref_use<'p>(
+    parts: impl Iterator<Item = &'p InterPartition>,
+    mut f: impl FnMut(u8, u32) -> Result<(), ReconstructError>,
+) -> Result<(), ReconstructError> {
+    for part in parts {
         let uses = [
             (
                 0u8,
@@ -12718,28 +13616,38 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
             ),
         ];
         for (list, ref_idx, used) in uses {
-            if !used || ref_idx < 0 {
-                continue;
-            }
-            let idx = ref_idx as u32;
-            let rp = ref_pics
-                .ref_pic(list, idx)
-                .ok_or(ReconstructError::MissingRefPic { list, idx })?;
-            if rp.width_in_samples == 0 || rp.height_in_samples == 0 {
-                return Err(ReconstructError::InvalidRefDims {
-                    width: rp.width_in_samples,
-                    height: rp.height_in_samples,
-                });
-            }
-            if (chroma_array_type == 1 || chroma_array_type == 2)
-                && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
-            {
-                return Err(ReconstructError::InvalidRefDims {
-                    width: rp.chroma_width(),
-                    height: rp.chroma_height(),
-                });
+            if used && ref_idx >= 0 {
+                f(list, ref_idx as u32)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// §8.4.2 — the checks the sample stage applies to reference picture
+/// `RefPicListX[ idx ]` (see [`ft_validate_inter_refs`]).
+pub(crate) fn ft_validate_ref<R: RefPicProvider>(
+    ref_pics: &R,
+    list: u8,
+    idx: u32,
+    chroma_array_type: u32,
+) -> Result<(), ReconstructError> {
+    let rp = ref_pics
+        .ref_pic(list, idx)
+        .ok_or(ReconstructError::MissingRefPic { list, idx })?;
+    if rp.width_in_samples == 0 || rp.height_in_samples == 0 {
+        return Err(ReconstructError::InvalidRefDims {
+            width: rp.width_in_samples,
+            height: rp.height_in_samples,
+        });
+    }
+    if (chroma_array_type == 1 || chroma_array_type == 2)
+        && (rp.chroma_width() == 0 || rp.chroma_height() == 0)
+    {
+        return Err(ReconstructError::InvalidRefDims {
+            width: rp.chroma_width(),
+            height: rp.chroma_height(),
+        });
     }
     Ok(())
 }
@@ -12760,6 +13668,9 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
     ref_pics: &R,
     pic: &mut Picture,
     grid: &mut MbGrid,
+    // `Some`: leave the §8.4.1 derivation of the inter macroblocks to
+    // [`ft_motion_stage`], checking here only what can reject them.
+    mut defer: Option<FtDefer<'_>>,
 ) -> (FtSlicePlan, Result<(), ReconstructError>) {
     let chroma_array_type = sps.chroma_array_type();
     grid.mbaff_frame_flag = false;
@@ -12797,10 +13708,31 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
                 false,
                 luma_scaling_plane(sps, slice_header),
                 None,
+                IntraPass::Checks,
             ) {
                 return (plan, Err(e));
             }
             plan.intra.push((idx, curr_addr, mb_qp_y));
+        } else if let Some(d) = defer.as_mut() {
+            if let Some(info) = grid.get_mut(curr_addr) {
+                info.slice_id = current_slice_id;
+                info.mb_field_decoding_flag = false;
+            }
+            if let Err(e) = ft_check_inter_mb(
+                mb,
+                curr_addr,
+                slice_header,
+                sps,
+                ref_pics,
+                pic,
+                grid,
+                current_slice_id,
+                d.refs,
+                &mut |list, ref_idx| (d.check_ref)(list, ref_idx, idx),
+            ) {
+                return (plan, Err(e));
+            }
+            plan.pending.push((idx, curr_addr, mb_qp_y));
         } else {
             let parts = match derive_mb_inter_motion(
                 mb,
@@ -12847,13 +13779,383 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
             info.mb_field_decoding_flag = false;
         }
         prev_qp_y = mb_qp_y;
+        plan.accepted = idx + 1;
     }
     (plan, Ok(()))
 }
 
+/// The deferred mode of [`ft_motion_pass`]: per-mbAddr reference
+/// indices the checks track (spatial direct reads its neighbours'),
+/// and the check of each reference use `(list, refIdx, macroblock
+/// index in the slice)`, in decoding order.
+pub(crate) struct FtDefer<'a> {
+    pub(crate) refs: &'a mut [[[i8; 4]; 2]],
+    pub(crate) check_ref: &'a mut dyn FnMut(u8, u32, usize) -> Result<(), ReconstructError>,
+}
+
+/// Frame threading — the decoding-order checks of one slice
+/// ([`ft_motion_pass`] in deferred mode) run where its slice data is
+/// parsed: they only look at the slice's own macroblocks (§6.4.8 makes
+/// every other slice's macroblocks unavailable), into a grid of their
+/// own. What depends on the reference lists (which picture each
+/// reference index names) is left to [`FtPrecheck::finish`].
+pub(crate) struct FtPrecheck {
+    plan: FtSlicePlan,
+    grid: MbGrid,
+    /// The macroblock at `plan.accepted` failed with this error.
+    error: Option<ReconstructError>,
+    /// Each distinct (list, refIdx) used, with the slice macroblock
+    /// index of its first use, in order of first use.
+    uses: Vec<(u8, u32, usize)>,
+}
+
+/// Whether [`ft_precheck`] applies to a slice: a frame-threading
+/// slice that is not a temporal-direct B slice.
+pub(crate) fn ft_precheck_applies(slice_header: &SliceHeader, sps: &Sps, pps: &Pps) -> bool {
+    ft_eligible_slice(slice_header, sps, pps)
+        && (slice_header.slice_type != SliceType::B || slice_header.direct_spatial_mv_pred_flag)
+}
+
+/// Run the decoding-order checks of a slice on its own (see
+/// [`FtPrecheck`]).
+pub(crate) fn ft_precheck(
+    slice_data: &SliceData,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+) -> FtPrecheck {
+    let w = sps.pic_width_in_mbs_minus1 + 1;
+    let h = (sps.pic_height_in_map_units_minus1 + 1) * if sps.frame_mbs_only_flag { 1 } else { 2 };
+    let mut grid = MbGrid::new(w, h);
+    // The intra checks read neighbouring samples' availability only.
+    let mut pic = Picture::new(0, 0, sps.chroma_array_type(), 8, 8);
+    pic.width_in_samples = w * 16;
+    pic.height_in_samples = h * 16;
+    let mut refs = vec![[[-1i8; 4]; 2]; grid.info.len()];
+    let mut uses: Vec<(u8, u32, usize)> = Vec::new();
+    let mut record = |list: u8, idx: u32, mb: usize| {
+        if !uses.iter().any(|&(l, i, _)| l == list && i == idx) {
+            uses.push((list, idx, mb));
+        }
+        Ok(())
+    };
+    let (plan, res) = ft_motion_pass(
+        slice_data,
+        slice_header,
+        sps,
+        pps,
+        &crate::ref_store::NoRefs,
+        &mut pic,
+        &mut grid,
+        Some(FtDefer {
+            refs: &mut refs,
+            check_ref: &mut record,
+        }),
+    );
+    FtPrecheck {
+        plan,
+        grid,
+        error: res.err(),
+        uses,
+    }
+}
+
+impl FtPrecheck {
+    /// Complete the checks against the slice's reference lists
+    /// `ref_pics` and fold the slice into the picture's `grid`: the
+    /// same plan, grid state and result [`ft_motion_pass`] in deferred
+    /// mode gives when run on the picture.
+    pub(crate) fn finish<R: RefPicProvider>(
+        self,
+        slice_header: &SliceHeader,
+        sps: &Sps,
+        ref_pics: &R,
+        grid: &mut MbGrid,
+    ) -> (FtSlicePlan, Result<(), ReconstructError>) {
+        let FtPrecheck {
+            mut plan,
+            grid: src,
+            mut error,
+            uses,
+        } = self;
+        let cat = sps.chroma_array_type();
+        // The first use of a reference the checks reject ends the slice
+        // there (its uses come in decoding order).
+        let mut ref_failure = false;
+        for &(list, idx, mb) in &uses {
+            if mb > plan.accepted || (mb == plan.accepted && error.is_some()) {
+                break;
+            }
+            if let Err(e) = ft_validate_ref(ref_pics, list, idx, cat) {
+                plan.accepted = mb;
+                plan.intra.retain(|&(i, _, _)| i < mb);
+                plan.pending.retain(|&(i, _, _)| i < mb);
+                error = Some(e);
+                ref_failure = true;
+                break;
+            }
+        }
+        let first = slice_header.first_mb_in_slice as usize;
+        let n = grid.info.len().min(src.info.len());
+        let end = (first + plan.accepted).min(n);
+        if first == 0
+            && end == n
+            && error.is_none()
+            && grid.width_in_mbs == src.width_in_mbs
+            && grid.info.iter().all(|i| !i.available && i.slice_id < 0)
+        {
+            *grid = src;
+        } else {
+            if first < end {
+                grid.info[first..end].clone_from_slice(&src.info[first..end]);
+            }
+            // The failing macroblock keeps what was stamped on it before
+            // the failure: by the checks for a rejected reference (an
+            // inter macroblock), all of it for any other failure.
+            if error.is_some() && end < n {
+                if ref_failure {
+                    let info = &mut grid.info[end];
+                    info.slice_id = first as i32;
+                    info.mb_field_decoding_flag = false;
+                } else {
+                    grid.info[end] = src.info[end];
+                }
+            }
+        }
+        grid.mbaff_frame_flag = false;
+        (plan, error.map_or(Ok(()), Err))
+    }
+}
+
+/// Frame threading — the checks [`derive_mb_inter_motion`] +
+/// [`ft_validate_inter_refs`] apply to an inter macroblock, without
+/// deriving motion vectors: the partition structure and every
+/// reference index the partitions use. A spatial-direct (§8.4.1.2.2)
+/// macroblock's reference indices come from its neighbours' (eq.
+/// 8-184), so `refs[mbAddr]` keeps each macroblock's per-8x8 refIdxL0 /
+/// refIdxL1 as §8.4.1 would store them. Temporal direct slices are not
+/// deferred (their reference indices follow the co-located picture's
+/// motion).
+#[allow(clippy::too_many_arguments)]
+fn ft_check_inter_mb<R: RefPicProvider>(
+    mb: &Macroblock,
+    mb_addr: u32,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    ref_pics: &R,
+    pic: &Picture,
+    grid: &MbGrid,
+    current_slice_id: i32,
+    refs: &mut [[[i8; 4]; 2]],
+    check_ref: &mut dyn FnMut(u8, u32) -> Result<(), ReconstructError>,
+) -> Result<(), ReconstructError> {
+    let direct = |part: (u8, u8, u8), r: (i8, i8)| {
+        let mode = match (r.0 >= 0, r.1 >= 0) {
+            (true, false) => PartMode::L0Only,
+            (false, true) => PartMode::L1Only,
+            _ => PartMode::Direct,
+        };
+        InterPartition {
+            x: part.0,
+            y: part.1,
+            w: part.2,
+            h: part.2,
+            mode,
+            shape: MvpredShape::Default,
+            ref_idx_l0: r.0,
+            ref_idx_l1: r.1,
+            mvd_l0: (0, 0),
+            mvd_l1: (0, 0),
+            is_skip: false,
+            precomputed_mv: None,
+        }
+    };
+    let parts: Vec<InterPartition> = match &mb.mb_type {
+        MbType::BSkip | MbType::BDirect16x16 => {
+            vec![direct(
+                (0, 0, 16),
+                light_spatial_direct_refs(grid, refs, mb_addr, current_slice_id),
+            )]
+        }
+        MbType::B8x8
+            if mb
+                .sub_mb_pred
+                .as_ref()
+                .is_some_and(|sm| sm.sub_mb_type.contains(&SubMbType::BDirect8x8)) =>
+        {
+            let sm = mb.sub_mb_pred.as_ref().expect("checked above");
+            let mut direct_refs = None;
+            let mut parts = Vec::with_capacity(4);
+            for (q, &sub_type) in sm.sub_mb_type.iter().enumerate() {
+                let (x, y) = ((q as u8 % 2) * 8, (q as u8 / 2) * 8);
+                if sub_type == SubMbType::BDirect8x8 {
+                    let r = *direct_refs.get_or_insert_with(|| {
+                        light_spatial_direct_refs(grid, refs, mb_addr, current_slice_id)
+                    });
+                    parts.push(direct((x, y, 8), r));
+                } else {
+                    let (mode, r0, r1) =
+                        b_sub_mode(sub_type, sm.ref_idx_l0[q] as i8, sm.ref_idx_l1[q] as i8);
+                    let mut p = direct((x, y, 8), (r0, r1));
+                    p.mode = mode;
+                    parts.push(p);
+                }
+            }
+            parts
+        }
+        _ => derive_inter_partitions(
+            mb,
+            slice_header,
+            sps,
+            ref_pics,
+            pic,
+            mb_addr,
+            grid,
+            current_slice_id,
+        )?,
+    };
+    for_each_ref_use(parts.iter(), check_ref)?;
+    // The per-8x8 reference indices §8.4.1 stores for the macroblock.
+    let mut r = [[-1i8; 4]; 2];
+    for p in &parts {
+        let (qx0, qy0) = (p.x as usize / 8, p.y as usize / 8);
+        let (qnx, qny) = ((p.w as usize).max(8) / 8, (p.h as usize).max(8) / 8);
+        for qy in qy0..(qy0 + qny).min(2) {
+            for qx in qx0..(qx0 + qnx).min(2) {
+                if p.mode != PartMode::L1Only {
+                    r[0][qy * 2 + qx] = p.ref_idx_l0;
+                }
+                if matches!(
+                    p.mode,
+                    PartMode::L1Only | PartMode::BiPred | PartMode::Direct
+                ) {
+                    r[1][qy * 2 + qx] = p.ref_idx_l1;
+                }
+            }
+        }
+    }
+    if let Some(slot) = refs.get_mut(mb_addr as usize) {
+        *slot = r;
+    }
+    Ok(())
+}
+
+/// §8.4.1.2.2 — the spatial-direct (refIdxL0, refIdxL1) of the
+/// macroblock at `mb_addr` (non-MBAFF raster picture) from the
+/// reference indices `refs` records for its neighbours A, B, C, D
+/// (§8.4.1.3.2 with the whole macroblock as the partition).
+fn light_spatial_direct_refs(
+    grid: &MbGrid,
+    refs: &[[[i8; 4]; 2]],
+    mb_addr: u32,
+    current_slice_id: i32,
+) -> (i8, i8) {
+    let w = grid.width_in_mbs as i32;
+    let (mb_x, mb_y) = grid.mb_xy(mb_addr);
+    let (mb_x, mb_y) = (mb_x as i32, mb_y as i32);
+    let neighbour = |dx: i32, dy: i32, quadrant: usize, list: usize| -> NeighbourMv {
+        let (nx, ny) = (mb_x + dx, mb_y + dy);
+        if nx < 0 || ny < 0 || nx >= w {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        let addr = (ny * w + nx) as u32;
+        let Some(info) = grid.get(addr) else {
+            return NeighbourMv::UNAVAILABLE;
+        };
+        if !info.available
+            || (current_slice_id >= 0 && info.slice_id >= 0 && info.slice_id != current_slice_id)
+        {
+            return NeighbourMv::UNAVAILABLE;
+        }
+        if info.is_intra {
+            return NeighbourMv::intra_but_mb_available();
+        }
+        match refs.get(addr as usize).map(|r| r[list][quadrant]) {
+            Some(r) if r >= 0 => NeighbourMv::new(r as i32, Mv::ZERO),
+            _ => NeighbourMv::intra_but_mb_available(),
+        }
+    };
+    // A = (−1, 0), B = (0, −1), C = (16, −1), D = (−1, −1).
+    let probe = |list: usize| {
+        [
+            neighbour(-1, 0, 1, list),
+            neighbour(0, -1, 2, list),
+            neighbour(1, -1, 2, list),
+            neighbour(-1, -1, 3, list),
+        ]
+    };
+    let (r0, r1, _) = spatial_direct_ref_idx(probe(0), probe(1));
+    (r0, r1)
+}
+
+/// Frame threading — §8.4.1 for the inter macroblocks
+/// [`ft_motion_pass`] deferred: walks every slice's accepted
+/// macroblocks in decoding order (re-establishing the availability the
+/// derivation sees), derives and stores each deferred macroblock's
+/// motion and adds its job to the slice's plan. `pic` carries the
+/// current picture's order counts / coding structure; each slice's
+/// reference lists must have their co-located motion resolved.
+pub(crate) fn ft_motion_stage(
+    works: &mut [crate::frame_thread::FtSliceWork],
+    pic: &Picture,
+    grid: &mut MbGrid,
+) {
+    if works.iter().all(|w| w.plan.pending.is_empty()) {
+        return;
+    }
+    grid.mbaff_frame_flag = false;
+    for info in grid.info.iter_mut() {
+        info.available = false;
+    }
+    for w in works.iter_mut() {
+        let first = w.header.first_mb_in_slice;
+        let current_slice_id = first as i32;
+        let pending = std::mem::take(&mut w.plan.pending);
+        let mut next = pending.iter().peekable();
+        for idx in 0..w.plan.accepted {
+            let addr = first + idx as u32;
+            if let Some(&&(pidx, paddr, qp_y)) = next.peek()
+                && pidx == idx
+            {
+                next.next();
+                match derive_mb_inter_motion(
+                    &w.sd.macroblocks[idx],
+                    paddr,
+                    &w.header,
+                    &w.sps,
+                    &w.refs,
+                    pic,
+                    grid,
+                    current_slice_id,
+                ) {
+                    Ok(parts) => {
+                        let (mb_x, mb_y) = grid.mb_xy(paddr);
+                        w.plan.inter.push(InterMbJob {
+                            idx,
+                            mb_x,
+                            mb_y,
+                            qp_y,
+                            parts,
+                        });
+                    }
+                    // Checked by `ft_check_inter_mb`; a failure here
+                    // ends the slice's sample stage at this macroblock.
+                    Err(_) => {
+                        w.plan.accepted = idx;
+                        w.plan.intra.retain(|&(i, _, _)| i < idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(info) = grid.get_mut(addr) {
+                info.available = true;
+            }
+        }
+    }
+}
+
 /// Frame threading — the §8.4.2 prediction + §8.5 residual of one inter
 /// macroblock of [`ft_motion_pass`]'s plan, written into `pic`.
-/// `scratch` is a one-macroblock picture.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     slice_data: &SliceData,
@@ -12862,44 +14164,23 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    scratch: &mut Picture,
     pic: &mut Picture,
 ) -> Result<(), ReconstructError> {
-    let chroma_array_type = sps.chroma_array_type();
+    let curr_poc = pic.pic_order_cnt;
     synth_mb_inter(
         &slice_data.macroblocks[job.idx],
         job,
-        chroma_array_type,
+        sps.chroma_array_type(),
         8 + sps.bit_depth_luma_minus8,
         8 + sps.bit_depth_chroma_minus8,
         slice_header,
         sps,
         pps,
         ref_pics,
-        pic.pic_order_cnt,
-        scratch,
-    )?;
-    let width = pic.width_in_samples as usize;
-    let x0 = job.mb_x as usize * 16;
-    let y0 = job.mb_y as usize * 16;
-    for y in 0..16 {
-        let o = (y0 + y) * width + x0;
-        pic.luma[o..o + 16].copy_from_slice(&scratch.luma[y * 16..y * 16 + 16]);
-    }
-    if chroma_array_type == 1 || chroma_array_type == 2 {
-        let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
-        let (mbw_c, mbh_c) = (mbw_c as usize, mbh_c as usize);
-        let cw = pic.chroma_width() as usize;
-        let cx0 = job.mb_x as usize * mbw_c;
-        let cy0 = job.mb_y as usize * mbh_c;
-        for y in 0..mbh_c {
-            let d = (cy0 + y) * cw + cx0;
-            let s = y * mbw_c;
-            pic.cb[d..d + mbw_c].copy_from_slice(&scratch.cb[s..s + mbw_c]);
-            pic.cr[d..d + mbw_c].copy_from_slice(&scratch.cr[s..s + mbw_c]);
-        }
-    }
-    Ok(())
+        curr_poc,
+        pic,
+        (job.mb_x as i32 * 16, job.mb_y as i32 * 16),
+    )
 }
 
 /// Frame threading — the §8.3 / §8.5 reconstruction of one intra
@@ -12931,6 +14212,7 @@ pub(crate) fn ft_intra_mb(
         false,
         luma_scaling_plane(sps, slice_header),
         None,
+        IntraPass::Samples,
     )
 }
 
@@ -13248,11 +14530,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -13389,11 +14671,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -13980,11 +15262,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb.clone(),
                 chroma_cr: cr.clone(),
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -14086,8 +15368,8 @@ mod tests {
                 info.qp_y = 46;
             }
         }
-        let before_cb: Vec<i32> = pic.cb.clone();
-        let before_cr: Vec<i32> = pic.cr.clone();
+        let before_cb: Vec<i32> = pic.cb.to_i32_vec();
+        let before_cr: Vec<i32> = pic.cr.to_i32_vec();
         deblock_plane_chroma_444(
             &mut pic,
             &grid,
@@ -14103,11 +15385,13 @@ mod tests {
         let cw = pic.chroma_width() as usize;
         let edge_changed_cb = (0..16).any(|y| {
             let row = y * cw;
-            pic.cb[row + 15] != before_cb[row + 15] || pic.cb[row + 16] != before_cb[row + 16]
+            pic.cb.get(row + 15) != before_cb[row + 15]
+                || pic.cb.get(row + 16) != before_cb[row + 16]
         });
         let edge_changed_cr = (0..16).any(|y| {
             let row = y * cw;
-            pic.cr[row + 15] != before_cr[row + 15] || pic.cr[row + 16] != before_cr[row + 16]
+            pic.cr.get(row + 15) != before_cr[row + 15]
+                || pic.cr.get(row + 16) != before_cr[row + 16]
         });
         assert!(edge_changed_cb, "Cb chroma edge not filtered at 4:4:4");
         assert!(edge_changed_cr, "Cr chroma edge not filtered at 4:4:4");
@@ -14117,7 +15401,7 @@ mod tests {
         // edges, not the whole plane.
         let interior_unchanged = (0..16).all(|y| {
             let row = y * cw;
-            pic.cb[row + 1] == before_cb[row + 1]
+            pic.cb.get(row + 1) == before_cb[row + 1]
         });
         assert!(
             interior_unchanged,
@@ -14212,8 +15496,8 @@ mod tests {
     /// Build a P_L0_16x16 MB with zero residual.
     fn make_p_l0_16x16(ref_idx: u32, mvd: [i32; 2]) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx],
-            mvd_l0: vec![mvd],
+            ref_idx_l0: vec![ref_idx].into(),
+            mvd_l0: vec![mvd].into(),
             ..MbPred::default()
         };
         Macroblock {
@@ -14364,14 +15648,14 @@ mod tests {
             smp.sub_mb_type[i] = SubMbType::BDirect8x8;
             smp.ref_idx_l0[i] = 0;
             smp.ref_idx_l1[i] = 0;
-            smp.mvd_l0[i] = vec![[0, 0]];
-            smp.mvd_l1[i] = vec![[0, 0]];
+            smp.mvd_l0[i] = vec![[0, 0]].into();
+            smp.mvd_l1[i] = vec![[0, 0]].into();
         }
         let mb = Macroblock {
             mb_type: MbType::P8x8,
             mb_type_raw: 3,
             mb_pred: None,
-            sub_mb_pred: Some(smp),
+            sub_mb_pred: Some(Box::new(smp)),
             pcm_samples: None,
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
@@ -14490,8 +15774,8 @@ mod tests {
 
         // Build a P_L0_L0_16x8 MB with top MVD=(16,0), bottom MVD=(0,0).
         let pred = crate::macroblock_layer::MbPred {
-            ref_idx_l0: vec![0, 0],
-            mvd_l0: vec![[16, 0], [0, 0]],
+            ref_idx_l0: vec![0, 0].into(),
+            mvd_l0: vec![[16, 0], [0, 0]].into(),
             ..crate::macroblock_layer::MbPred::default()
         };
         let mb = Macroblock {
@@ -14675,9 +15959,9 @@ mod tests {
 
         // MB 1's MV grid slots should all be (3, 4) — inherited from MB 0.
         let info1 = grid.get(1).unwrap();
-        for blk4 in 0..16 {
+        for (blk4, mv) in info1.mv_l0.iter().enumerate() {
             assert_eq!(
-                info1.mv_l0[blk4],
+                *mv,
                 (3i16, 4i16),
                 "MB 1's blk{blk4} MV should inherit MB 0's MV via median, \
                  NOT be forced to zero by the P_Skip zero-MV substitution",
@@ -14718,8 +16002,8 @@ mod tests {
         assert!(!info0.is_intra);
         assert_eq!(info0.ref_idx_l0, [0, 0, 0, 0]);
         // Every 4x4 block in MB 0 should carry mv = (4, 8).
-        for blk4 in 0..16 {
-            assert_eq!(info0.mv_l0[blk4], (4i16, 8i16));
+        for mv in &info0.mv_l0 {
+            assert_eq!(*mv, (4i16, 8i16));
         }
     }
 
@@ -14847,10 +16131,10 @@ mod tests {
     /// indices.
     fn make_b_bi_16x16(ref_idx_l0: u32, ref_idx_l1: u32) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx_l0],
-            ref_idx_l1: vec![ref_idx_l1],
-            mvd_l0: vec![[0, 0]],
-            mvd_l1: vec![[0, 0]],
+            ref_idx_l0: vec![ref_idx_l0].into(),
+            ref_idx_l1: vec![ref_idx_l1].into(),
+            mvd_l0: vec![[0, 0]].into(),
+            mvd_l1: vec![[0, 0]].into(),
             ..MbPred::default()
         };
         Macroblock {
@@ -15977,7 +17261,10 @@ mod tests {
         let (px, py) = (0i32, 0i32);
 
         let mut luma = vec![0i32; (w * h) as usize];
-        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma, None, None).unwrap();
+        mc_luma_partition(
+            &ref_pic, px, py, mv, w, h, 8, &mut luma, w as usize, None, None,
+        )
+        .unwrap();
 
         let mut cb = vec![0i32; (w * h) as usize];
         let mut cr = vec![0i32; (w * h) as usize];
@@ -16122,7 +17409,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 
@@ -16167,7 +17466,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 

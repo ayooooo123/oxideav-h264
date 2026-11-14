@@ -272,7 +272,8 @@ fn parse_slice_data_impl(
         return Err(SliceDataError::SliceQpOutOfRange(slice_qp_y));
     }
 
-    // Pre-sized below once PicSizeInMbs is computed.
+    let mut macroblocks: Vec<Macroblock> = Vec::new();
+    let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
     // §8.2.2 / §7.3.4 — FMO slice group map (round-453): NextMbAddress
     // walks the current slice group instead of the raster successor.
@@ -295,13 +296,12 @@ fn parse_slice_data_impl(
     // so the product fits in u32 by construction. Used downstream to
     // bound `mb_skip_run` and to detect MB-address overflow.
     let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
-    let init_cap = if slice_header.first_mb_in_slice == 0 && pps.num_slice_groups_minus1 == 0 {
-        (pic_size_in_mbs as usize).saturating_mul(1 + usize::from(mbaff_frame_flag)).min(32_768)
-    } else {
-        (pic_size_in_mbs.saturating_sub(slice_header.first_mb_in_slice) as usize).clamp(64, 4096)
-    };
-    let mut macroblocks: Vec<Macroblock> = Vec::with_capacity(init_cap);
-    let mut mb_field_decoding_flags: Vec<bool> = Vec::with_capacity(init_cap);
+    // Room for the rest of the picture's macroblocks (bounded: a
+    // malformed header must not reserve unbounded memory), so the walk
+    // does not re-allocate and move the macroblocks it collected.
+    macroblocks.reserve(
+        (pic_size_in_mbs.saturating_sub(slice_header.first_mb_in_slice) as usize).min(1 << 14),
+    );
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
@@ -789,11 +789,11 @@ fn parse_slice_data_impl(
                             mb_type_raw: 25,
                             mb_pred: None,
                             sub_mb_pred: None,
-                            pcm_samples: Some(PcmSamples {
+                            pcm_samples: Some(Box::new(PcmSamples {
                                 luma,
                                 chroma_cb: cb,
                                 chroma_cr: cr,
-                            }),
+                            })),
                             coded_block_pattern: 0,
                             transform_size_8x8_flag: false,
                             mb_qp_delta: 0,
